@@ -1,4 +1,3 @@
-use crate::page::ONLY_RESOURCES;
 use phf::phf_set;
 use url::Url;
 
@@ -34,47 +33,57 @@ pub(crate) fn convert_abs_url(u: &mut Url) {
     }
 }
 
-/// convert abs path without url returning a new url
-pub(crate) fn convert_abs_url_base(u: &Url) -> Url {
-    let mut u = u.clone();
-    convert_abs_url(&mut u);
-    u
-}
-
 /// Parse the absolute url
 pub(crate) fn parse_absolute_url(url: &str) -> Option<Box<Url>> {
     match url::Url::parse(url) {
         Ok(mut u) => {
             convert_abs_url(&mut u);
+            u.set_query(None);
             Some(Box::new(u))
         }
         _ => None,
     }
 }
 
-/// Convert to absolute path. The base url must be the root path to avoid infinite appending.
-#[inline]
-pub(crate) fn convert_abs_path(base: &Url, href: &str) -> Url {
-    let href = href.trim();
+/// Firewall protection. This does nothing without the [firewall] flag.
+#[cfg(feature = "firewall")]
+pub(crate) fn block_website(u: &Url) -> bool {
+    let mut blocked = false;
 
+    if let Some(host) = u.host_str() {
+        if spider_firewall::is_bad_website_url(&host) {
+            blocked = true;
+        }
+    }
+
+    blocked
+}
+
+/// Firewall protection. This does nothing without the [firewall] flag.
+#[cfg(not(feature = "firewall"))]
+pub(crate) fn block_website(_u: &Url) -> bool {
+    false
+}
+
+/// Return handling for the links
+enum LinkReturn {
+    /// Early return
+    EarlyReturn,
+    /// Empty ignore
+    Empty,
+    /// Absolute url
+    Absolute(Url),
+}
+
+#[inline]
+/// Handle the base url return to determine 3rd party urls.
+fn handle_base(href: &str) -> LinkReturn {
     if href.is_empty() || href == "#" || href == "javascript:void(0);" {
-        return base.clone();
+        return LinkReturn::EarlyReturn;
     }
 
     // handle absolute urls.
     if !href.starts_with("/") {
-        let protocol_slice = if href.is_char_boundary(8) {
-            &href[0..8]
-        } else if href.is_char_boundary(7) {
-            &href[0..7]
-        } else if href.is_char_boundary(6) {
-            &href[0..6]
-        } else if href.is_char_boundary(5) {
-            &href[0..5]
-        } else {
-            ""
-        };
-
         // ignore protocols that are not crawlable
         if let Some(protocol_end) = href.find(':') {
             // Extract the potential protocol up to and including the ':'
@@ -82,38 +91,63 @@ pub(crate) fn convert_abs_path(base: &Url, href: &str) -> Url {
 
             // Ignore protocols that are in the IGNORED_PROTOCOLS set
             if IGNORED_PROTOCOLS.contains(protocol_slice_section) {
-                return base.clone();
+                return LinkReturn::EarlyReturn;
             }
 
-            // valid protocol to take absolute
+            let protocol_slice = if href.is_char_boundary(8) {
+                &href[0..8]
+            } else if href.is_char_boundary(7) {
+                &href[0..7]
+            } else if href.is_char_boundary(6) {
+                &href[0..6]
+            } else if href.is_char_boundary(5) {
+                &href[0..5]
+            } else {
+                ""
+            };
+
             if protocol_slice.len() >= protocol_end + 3 {
-                let protocol_slice = &href[..protocol_end + 3]; // +3 to include "://"
+                if let Some((start_idx, _)) = href.char_indices().nth(protocol_end + 2) {
+                    let mut char_indices = href.char_indices().skip(protocol_end + 2);
+                    let mut end_idx = start_idx;
 
-                if PROTOCOLS.contains(protocol_slice) {
-                    if let Ok(mut next_url) = Url::parse(href) {
-                        next_url.set_fragment(None);
-                        return next_url;
+                    for _ in 0..3 {
+                        if let Some((idx, _)) = char_indices.next() {
+                            end_idx = idx;
+                        } else {
+                            end_idx = href.len();
+                            break;
+                        }
+                    }
+
+                    if PROTOCOLS.contains(&href[..end_idx]) {
+                        if let Ok(mut next_url) = Url::parse(href) {
+                            next_url.set_fragment(None);
+                            return LinkReturn::Absolute(next_url);
+                        }
                     }
                 }
             }
         }
+    }
 
-        if let Some(position) = href.rfind('.') {
-            let hlen = href.len();
-            let has_asset = hlen - position;
-            if has_asset >= 3 {
-                let next_position = position + 1;
-                if !ONLY_RESOURCES.contains::<case_insensitive_string::CaseInsensitiveString>(
-                    &href[next_position..].into(),
-                ) {
-                    let full_url = format!("{}://{}", base.scheme(), href);
-                    if let Ok(mut next_url) = Url::parse(&full_url) {
-                        next_url.set_fragment(None);
-                        return next_url;
-                    }
-                }
-            }
-        }
+    LinkReturn::Empty
+}
+
+/// Convert to absolute path. The base url must be the root path to avoid infinite appending.
+/// We always handle the urls from the base path.
+#[inline]
+pub(crate) fn convert_abs_path(base: &Url, href: &str) -> Url {
+    let href = href.trim();
+
+    if base.as_str() == href {
+        return base.to_owned();
+    }
+
+    match handle_base(href) {
+        LinkReturn::Absolute(u) => return u,
+        LinkReturn::EarlyReturn => return base.to_owned(),
+        _ => (),
     }
 
     // we can swap the domains if they do not match incase of crawler redirect anti-bot
@@ -122,18 +156,18 @@ pub(crate) fn convert_abs_path(base: &Url, href: &str) -> Url {
             joined.set_fragment(None);
             joined
         }
-        Err(_) => base.clone(),
+        Err(_) => base.to_owned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::convert_abs_path;
-    use url::Url;
+    use crate::utils::parse_absolute_url;
 
     #[test]
     fn test_basic_join() {
-        let base = Url::parse("https://example.com/path/").unwrap();
+        let base = parse_absolute_url("https://example.com/path/").unwrap();
         let href = "/subpage";
         let result = convert_abs_path(&base, href);
         assert_eq!(result.as_str(), "https://example.com/subpage");
@@ -141,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_absolute_href() {
-        let base = Url::parse("https://example.com/path/").unwrap();
+        let base = parse_absolute_url("https://example.com/path/").unwrap();
         let href = "https://example.org/anotherpath";
         let result = convert_abs_path(&base, href);
         assert_eq!(result.as_str(), href);
@@ -149,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_slash_join() {
-        let base = Url::parse("https://example.com/path/").unwrap();
+        let base = parse_absolute_url("https://example.com/path/").unwrap();
         let href = "/absolute";
         let result = convert_abs_path(&base, href);
         assert_eq!(result.as_str(), "https://example.com/absolute");
@@ -157,15 +191,15 @@ mod tests {
 
     #[test]
     fn test_empty_href() {
-        let base = Url::parse("https://example.com/path/").unwrap();
+        let base = parse_absolute_url("https://example.com/path/").unwrap();
         let href = "";
         let result = convert_abs_path(&base, href);
-        assert_eq!(result.as_str(), "https://example.com/path/");
+        assert_eq!(result.as_str(), "https://example.com/");
     }
 
     #[test]
     fn test_double_dot_href() {
-        let base = Url::parse("https://example.com/path/").unwrap();
+        let base = parse_absolute_url("https://example.com/path/").unwrap();
         let href = "..";
         let result = convert_abs_path(&base, href);
         assert_eq!(result.as_str(), "https://example.com/");
@@ -173,19 +207,19 @@ mod tests {
 
     #[test]
     fn test_domain_like_link() {
-        let base = Url::parse("https://www.example.com/path/").unwrap();
+        let base = parse_absolute_url("https://www.example.com/path/").unwrap();
         let href = "example.org/another-path";
         let result = convert_abs_path(&base, href);
         assert_eq!(
             result.as_str(),
-            "https://example.org/another-path",
+            "https://www.example.com/example.org/another-path",
             "Should treat as a domain"
         );
     }
 
     #[test]
     fn test_relative_path_with_slash() {
-        let base = Url::parse("https://www.example.com/path/").unwrap();
+        let base = parse_absolute_url("https://www.example.com/path/").unwrap();
         let href = "/another-path";
         let result = convert_abs_path(&base, href);
         assert_eq!(
@@ -197,19 +231,19 @@ mod tests {
 
     #[test]
     fn test_no_protocol_with_slash() {
-        let base = Url::parse("https://www.example.com/path/").unwrap();
+        let base = parse_absolute_url("https://www.example.com/path/").unwrap();
         let href = "example.com/other-path";
         let result = convert_abs_path(&base, href);
         assert_eq!(
             result.as_str(),
-            "https://example.com/other-path",
+            "https://www.example.com/example.com/other-path",
             "Should treat domain-like href as full URL"
         );
     }
 
     #[test]
     fn test_no_invalid_protocols() {
-        let base = Url::parse("https://www.example.com").unwrap();
+        let base = parse_absolute_url("https://www.example.com").unwrap();
         let href = "mailto:info@laminarpharma.com";
         let result = convert_abs_path(&base, href);
 

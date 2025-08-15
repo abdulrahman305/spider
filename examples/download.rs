@@ -22,7 +22,7 @@ async fn main() {
 
     env_logger::init_from_env(env);
 
-    let website_name = "https://rsseau.fr/en";
+    let website_name = "https://spider.cloud";
 
     let mut website: Website = Website::new(website_name);
 
@@ -46,11 +46,8 @@ async fn main() {
             .open(&download_file)
             .expect("Unable to open file");
 
-        match page.get_bytes() {
-            Some(b) => {
-                file.write_all(b).unwrap_or_default();
-            }
-            _ => (),
+        if let Some(b) = page.get_bytes() {
+            file.write_all(b).unwrap_or_default();
         }
 
         log("downloaded", download_file)

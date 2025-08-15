@@ -19,10 +19,10 @@ impl std::fmt::Display for Prompt {
 
 #[cfg(feature = "openai")]
 impl std::str::FromStr for Prompt {
-    type Err = serde_json::Error;
+    type Err = super::serde_json::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Ok(prompts) = serde_json::from_str::<Vec<String>>(s) {
+        if let Ok(prompts) = super::serde_json::from_str::<Vec<String>>(s) {
             Ok(Prompt::Multi(
                 prompts
                     .into_iter()
@@ -120,7 +120,7 @@ pub struct GPTConfigs {
     pub top_p: Option<f32>,
     /// Prompts to use for certain urls. If this is set only the urls that match exactly are ran.
     pub prompt_url_map:
-        Option<hashbrown::HashMap<case_insensitive_string::CaseInsensitiveString, Self>>,
+        Option<Box<hashbrown::HashMap<case_insensitive_string::CaseInsensitiveString, Box<Self>>>>,
     #[cfg_attr(feature = "serde", serde(default))]
     /// Extra data, this will merge the prompts and try to get the content for you. Example: extracting data from the page.
     pub extra_ai_data: bool,
@@ -303,7 +303,7 @@ mod prompt_deserializer {
 #[cfg(feature = "openai")]
 fn deserialize_gpt_configs() {
     let gpt_configs_json = "{\"prompt\":\"change background blue\",\"model\":\"gpt-3.5-turbo-16k\",\"max_tokens\":256,\"temperature\":0.54,\"top_p\":0.17}";
-    let configs = match serde_json::from_str::<GPTConfigs>(&gpt_configs_json) {
+    let configs = match crate::features::serde_json::from_str::<GPTConfigs>(&gpt_configs_json) {
         Ok(e) => Some(e),
         _ => None,
     };

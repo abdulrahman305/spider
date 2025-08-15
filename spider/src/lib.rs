@@ -11,11 +11,10 @@
 //!
 //! There are a couple of ways to use Spider:
 //!
-//! - **Crawl** starts crawling a web page and
-//!   perform most work in isolation.
-//!   - [`crawl`] is used to crawl concurrently.
-//! - **Scrape** Scrape the page and hold onto the HTML raw string to parse.
-//!   - [`scrape`] is used to gather the HTML.
+//! - [`crawl`]: start concurrently crawling a site. Can be used to send each page (including URL
+//!   and HTML) to a subscriber for processing, or just to gather links.
+//!
+//! - [`scrape`]: like `crawl`, but saves the HTML raw strings to parse after scraping is complete.
 //!
 //! [`crawl`]: website/struct.Website.html#method.crawl
 //! [`scrape`]: website/struct.Website.html#method.scrape
@@ -71,8 +70,12 @@
 //! ## Feature flags
 //!
 //! - `ua_generator`: Enables auto generating a random real User-Agent.
-//! - `regex`: Enables blacklisting paths with regx
-//! - `jemalloc`: Enables the [jemalloc](https://github.com/jemalloc/jemalloc) memory backend.
+//! - `disk`: Enables SQLite hybrid disk storage to balance memory usage with no tls.
+//! - `disk_native_tls`: Enables SQLite hybrid disk storage to balance memory usage with native tls.
+//! - `disk_aws`: Enables SQLite hybrid disk storage to balance memory usage with aws_tls.
+//! - `balance`: Enables balancing the CPU and memory to scale more efficiently.
+//! - `regex`: Enables blacklisting paths with regx.
+//! - `firewall`: Enables spider_firewall crate to prevent bad websites from crawling.
 //! - `decentralized`: Enables decentralized processing of IO, requires the [spider_worker](https://docs.rs/crate/spider_worker/latest) startup before crawls.
 //! - `sync`: Subscribe to changes for Page data processing async.
 //! - `control`: Enables the ability to pause, start, and shutdown crawls on demand.
@@ -108,17 +111,6 @@
 //! Additional learning resources include:
 //!
 //! - [Spider Repository Examples](https://github.com/spider-rs/spider/tree/main/examples)
-
-// performance reasons jemalloc memory backend for dedicated work and large crawls
-#[cfg(all(
-    not(windows),
-    not(target_os = "android"),
-    not(target_env = "musl"),
-    feature = "jemalloc"
-))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 pub extern crate bytes;
 pub extern crate case_insensitive_string;
 pub extern crate hashbrown;
@@ -127,6 +119,7 @@ pub extern crate percent_encoding;
 pub extern crate quick_xml;
 pub extern crate reqwest;
 pub extern crate smallvec;
+pub extern crate spider_fingerprint;
 pub extern crate tokio;
 pub extern crate tokio_stream;
 pub extern crate url;
@@ -135,7 +128,6 @@ pub extern crate url;
 pub extern crate async_job;
 #[cfg(feature = "openai")]
 pub extern crate async_openai;
-#[cfg(feature = "encoding")]
 pub extern crate auto_encoder;
 #[cfg(feature = "flexbuffers")]
 pub extern crate flexbuffers;
@@ -154,9 +146,11 @@ pub extern crate string_concat;
 pub extern crate strum;
 #[macro_use]
 pub extern crate lazy_static;
-#[macro_use]
-pub extern crate fast_html5ever;
+#[cfg(feature = "firewall")]
+pub extern crate spider_firewall;
 
+/// Client interface.
+pub mod client;
 /// Configuration structure for `Website`.
 pub mod configuration;
 /// Optional features to use.
@@ -172,6 +166,7 @@ pub mod website;
 
 pub use case_insensitive_string::compact_str;
 pub use case_insensitive_string::CaseInsensitiveString;
+pub use client::{Client, ClientBuilder};
 
 #[cfg(feature = "chrome")]
 pub use chromiumoxide;
@@ -195,20 +190,6 @@ pub mod black_list {
         blacklist_url.contains(link)
     }
 }
-
-/// The asynchronous Client to make requests with.
-#[cfg(not(feature = "cache_request"))]
-pub type Client = reqwest::Client;
-#[cfg(not(feature = "cache_request"))]
-/// The asynchronous Client Builder.
-pub type ClientBuilder = reqwest::ClientBuilder;
-
-/// The asynchronous Client to make requests with HTTP Cache.
-#[cfg(feature = "cache_request")]
-pub type Client = reqwest_middleware::ClientWithMiddleware;
-#[cfg(feature = "cache_request")]
-/// The asynchronous Client Builder.
-pub type ClientBuilder = reqwest_middleware::ClientBuilder;
 
 /// The selectors type. The values are held to make sure the relative domain can be crawled upon base redirects.
 pub type RelativeSelectors = (

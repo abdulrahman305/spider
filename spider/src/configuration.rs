@@ -7,9 +7,14 @@ pub use crate::features::chrome_common::{
     WaitForIdleNetwork, WaitForSelector, WebAutomation,
 };
 pub use crate::features::openai_common::GPTConfigs;
+use crate::utils::get_domain_from_url;
 use crate::website::CronType;
 use reqwest::header::{AsHeaderName, HeaderMap, HeaderName, HeaderValue, IntoHeaderName};
+use std::net::IpAddr;
 use std::time::Duration;
+
+#[cfg(feature = "chrome")]
+pub use spider_fingerprint::Fingerprint;
 
 /// Redirect policy configuration for request
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -28,11 +33,17 @@ pub enum RedirectPolicy {
     )]
     /// A strict policy only allowing request that match the domain set for crawling.
     Strict,
+    #[cfg_attr(
+        feature = "serde",
+        serde(alias = "None", alias = "none", alias = "NONE",)
+    )]
+    /// Prevent all redirects.
+    None,
 }
 
 #[cfg(not(feature = "regex"))]
 /// Allow list normal matching paths.
-pub type AllowList = Box<Vec<CompactString>>;
+pub type AllowList = Vec<CompactString>;
 
 #[cfg(feature = "regex")]
 /// Allow list regex.
@@ -42,6 +53,72 @@ pub type AllowList = Box<regex::RegexSet>;
 #[derive(Debug, Default, Clone)]
 #[cfg_attr(not(feature = "regex"), derive(PartialEq, Eq))]
 pub struct AllowListSet(pub AllowList);
+
+#[cfg(feature = "chrome")]
+/// Track the events made via chrome.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ChromeEventTracker {
+    /// Track the responses.
+    pub responses: bool,
+    /// Track the requests.
+    pub requests: bool,
+    /// Track the changes between web automation.
+    pub automation: bool,
+}
+
+#[cfg(feature = "chrome")]
+impl ChromeEventTracker {
+    /// Create a new chrome event tracker
+    pub fn new(requests: bool, responses: bool) -> Self {
+        ChromeEventTracker {
+            requests,
+            responses,
+            automation: true,
+        }
+    }
+}
+
+#[cfg(feature = "sitemap")]
+#[derive(Debug, Default)]
+/// Determine if the sitemap modified to the whitelist.
+pub(crate) struct SitemapWhitelistChanges {
+    /// Added the default sitemap.xml whitelist.
+    pub added_default: bool,
+    /// Added the custom whitelist path.
+    pub added_custom: bool,
+}
+
+#[cfg(feature = "sitemap")]
+impl SitemapWhitelistChanges {
+    /// Was the whitelist modified?
+    pub(crate) fn modified(&self) -> bool {
+        self.added_default || self.added_custom
+    }
+}
+
+/// Determine allow proxy
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ProxyIgnore {
+    /// Chrome proxy.
+    Chrome,
+    /// HTTP proxy.
+    Http,
+    #[default]
+    /// Do not ignore
+    No,
+}
+
+/// The networking proxy to use.
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RequestProxy {
+    /// The proxy address.
+    pub addr: String,
+    /// Ignore the proxy when running a request type.
+    pub ignore: ProxyIgnore,
+}
 
 /// Structure to configure `Website` crawler
 /// ```rust
@@ -62,6 +139,7 @@ pub struct AllowListSet(pub AllowList);
     derive(PartialEq)
 )]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct Configuration {
     /// Respect robots.txt file and not scrape not allowed files. This may slow down crawls if robots.txt file has a delay included.
     pub respect_robots_txt: bool,
@@ -69,12 +147,14 @@ pub struct Configuration {
     pub subdomains: bool,
     /// Allow all tlds for domain.
     pub tld: bool,
+    /// The max timeout for the crawl.
+    pub crawl_timeout: Option<Duration>,
     /// Preserve the HTTP host header from being included.
     pub preserve_host_header: bool,
     /// List of pages to not crawl. [optional: regex pattern matching]
-    pub blacklist_url: Option<Box<Vec<CompactString>>>,
+    pub blacklist_url: Option<Vec<CompactString>>,
     /// List of pages to only crawl. [optional: regex pattern matching]
-    pub whitelist_url: Option<Box<Vec<CompactString>>>,
+    pub whitelist_url: Option<Vec<CompactString>>,
     /// User-Agent for request.
     pub user_agent: Option<Box<CompactString>>,
     /// Polite crawling delay in milli seconds.
@@ -84,7 +164,7 @@ pub struct Configuration {
     /// Use HTTP2 for connection. Enable if you know the website has http2 support.
     pub http2_prior_knowledge: bool,
     /// Use proxy list for performing network request.
-    pub proxies: Option<Box<Vec<String>>>,
+    pub proxies: Option<Vec<RequestProxy>>,
     /// Headers to include with request.
     pub headers: Option<Box<SerializableHeaderMap>>,
     #[cfg(feature = "sitemap")]
@@ -100,34 +180,23 @@ pub struct Configuration {
     #[cfg(feature = "cookies")]
     /// Cookie string to use for network requests ex: "foo=bar; Domain=blog.spider"
     pub cookie_str: Box<String>,
+    #[cfg(feature = "wreq")]
+    /// The type of request emulation. This does nothing without the flag `sync` enabled.
+    pub emulation: Option<wreq_util::Emulation>,
     #[cfg(feature = "cron")]
     /// Cron string to perform crawls - use <https://crontab.guru/> to help generate a valid cron for needs.
     pub cron_str: String,
     #[cfg(feature = "cron")]
     /// The type of cron to run either crawl or scrape.
     pub cron_type: CronType,
-    /// The max depth to crawl for a website.
+    /// The max depth to crawl for a website. Defaults to 25 to help prevent infinite recursion.
     pub depth: usize,
     /// The depth to crawl pertaining to the root.
     pub depth_distance: usize,
-    /// Cache the page following HTTP caching rules.
-    #[cfg(any(feature = "cache_request", feature = "chrome"))]
-    pub cache: bool,
-    #[cfg(feature = "chrome")]
     /// Use stealth mode for requests.
-    pub stealth_mode: bool,
-    /// Configure the viewport for chrome. This does nothing without the flag `chrome` enabled.
-    #[cfg(feature = "chrome")]
+    pub stealth_mode: spider_fingerprint::configs::Tier,
+    /// Configure the viewport for chrome and viewport headers.
     pub viewport: Option<Viewport>,
-    /// Overrides default host system timezone with the specified one. This does nothing without the flag `chrome` enabled.
-    #[cfg(feature = "chrome")]
-    pub timezone_id: Option<Box<String>>,
-    /// Overrides default host system locale with the specified one. This does nothing without the flag `chrome` enabled.
-    #[cfg(feature = "chrome")]
-    pub locale: Option<Box<String>>,
-    /// Set a custom script to eval on each new document. This does nothing without the flag `chrome` enabled.
-    #[cfg(feature = "chrome")]
-    pub evaluate_on_new_document: Option<Box<String>>,
     /// Crawl budget for the paths. This helps prevent crawling extra pages and limiting the amount.
     pub budget: Option<hashbrown::HashMap<case_insensitive_string::CaseInsensitiveString, u32>>,
     /// If wild card budgeting is found for the website.
@@ -137,42 +206,20 @@ pub struct Configuration {
         Box<hashbrown::HashSet<case_insensitive_string::CaseInsensitiveString>>,
     /// Collect all the resources found on the page.
     pub full_resources: bool,
-    #[cfg(feature = "chrome")]
-    /// Dismiss dialogs.
-    pub dismiss_dialogs: Option<bool>,
-    #[cfg(feature = "chrome")]
-    /// Wait for options for the page.
-    pub wait_for: Option<WaitFor>,
-    #[cfg(feature = "chrome")]
-    /// Take a screenshot of the page.
-    pub screenshot: Option<ScreenShotConfig>,
     /// Dangerously accept invalid certficates.
     pub accept_invalid_certs: bool,
     /// The auth challenge response. The 'chrome_intercept' flag is also required in order to intercept the response.
     pub auth_challenge_response: Option<AuthChallengeResponse>,
     /// The OpenAI configs to use to help drive the chrome browser. This does nothing without the 'openai' flag.
-    pub openai_config: Option<GPTConfigs>,
-    /// Setup fingerprint ID on each document. This does nothing without the flag `chrome` enabled.
-    #[cfg(feature = "chrome")]
-    pub fingerprint: bool,
-    /// The chrome connection url. Useful for targeting different headless instances. Defaults to using the env CHROME_URL.
-    #[cfg(feature = "chrome")]
-    pub chrome_connection_url: Option<String>,
-    /// Scripts to execute for individual pages, the full path of the url is required for an exact match. This is useful for running one off JS on pages like performing custom login actions.
-    #[cfg(feature = "chrome")]
-    pub execution_scripts: Option<ExecutionScripts>,
-    /// Web automation scripts to run up to a duration of 60 seconds.
-    #[cfg(feature = "chrome")]
-    pub automation_scripts: Option<AutomationScripts>,
+    pub openai_config: Option<Box<GPTConfigs>>,
     /// Use a shared queue strategy when crawling. This can scale workloads evenly that do not need priority.
     pub shared_queue: bool,
     /// Return the page links in the subscription channels. This does nothing without the flag `sync` enabled.
     pub return_page_links: bool,
     /// Retry count to attempt to swap proxies etc.
     pub retry: u8,
-    /// Setup network interception for request. This does nothing without the flag `chrome_intercept` enabled.
-    #[cfg(feature = "chrome")]
-    pub chrome_intercept: RequestInterceptConfiguration,
+    /// Skip spawning a control thread that can pause, start, and shutdown the crawl.
+    pub no_control_thread: bool,
     /// The blacklist urls.
     blacklist: AllowListSet,
     /// The whitelist urls.
@@ -184,6 +231,70 @@ pub struct Configuration {
     pub only_html: bool,
     /// The concurrency limits to apply.
     pub concurrency_limit: Option<usize>,
+    /// Normalize the html de-deplucating the content.
+    pub normalize: bool,
+    /// Modify the headers to act like a real-browser
+    pub modify_headers: bool,
+    /// Cache the page following HTTP caching rules.
+    #[cfg(any(feature = "cache_request", feature = "chrome"))]
+    pub cache: bool,
+    #[cfg(feature = "chrome")]
+    /// Enable or disable service workers. Enabled by default.
+    pub service_worker_enabled: bool,
+    #[cfg(feature = "chrome")]
+    /// Overrides default host system timezone with the specified one.
+    #[cfg(feature = "chrome")]
+    pub timezone_id: Option<Box<String>>,
+    /// Overrides default host system locale with the specified one.
+    #[cfg(feature = "chrome")]
+    pub locale: Option<Box<String>>,
+    /// Set a custom script to eval on each new document.
+    #[cfg(feature = "chrome")]
+    pub evaluate_on_new_document: Option<Box<String>>,
+    #[cfg(feature = "chrome")]
+    /// Dismiss dialogs.
+    pub dismiss_dialogs: Option<bool>,
+    #[cfg(feature = "chrome")]
+    /// Wait for options for the page.
+    pub wait_for: Option<WaitFor>,
+    #[cfg(feature = "chrome")]
+    /// Take a screenshot of the page.
+    pub screenshot: Option<ScreenShotConfig>,
+    #[cfg(feature = "chrome")]
+    /// Track the events made via chrome.
+    pub track_events: Option<ChromeEventTracker>,
+    #[cfg(feature = "chrome")]
+    /// Setup fingerprint ID on each document. This does nothing without the flag `chrome` enabled.
+    pub fingerprint: Fingerprint,
+    #[cfg(feature = "chrome")]
+    /// The chrome connection url. Useful for targeting different headless instances. Defaults to using the env CHROME_URL.
+    pub chrome_connection_url: Option<String>,
+    /// Scripts to execute for individual pages, the full path of the url is required for an exact match. This is useful for running one off JS on pages like performing custom login actions.
+    #[cfg(feature = "chrome")]
+    pub execution_scripts: Option<ExecutionScripts>,
+    /// Web automation scripts to run up to a duration of 60 seconds.
+    #[cfg(feature = "chrome")]
+    pub automation_scripts: Option<AutomationScripts>,
+    /// Setup network interception for request. This does nothing without the flag `chrome_intercept` enabled.
+    #[cfg(feature = "chrome")]
+    pub chrome_intercept: RequestInterceptConfiguration,
+    /// The referer to use.
+    pub referer: Option<String>,
+    /// Determine the max bytes per page.
+    pub max_page_bytes: Option<f64>,
+    #[cfg(feature = "chrome")]
+    /// Disables log domain, prevents further log entries from being reported to the client. This does nothing without the flag `chrome` enabled.
+    pub disable_log: bool,
+    #[cfg(feature = "chrome")]
+    /// Automatic locale and timezone handling via third party. This does nothing without the flag `chrome` enabled.
+    pub auto_geolocation: bool,
+    #[cfg(feature = "chrome")]
+    /// Enables bypassing CSP. This does nothing without the flag `chrome` enabled.
+    pub bypass_csp: bool,
+    /// Bind the connections only on the network interface.
+    pub network_interface: Option<String>,
+    /// Bind to a local IP Address.
+    pub local_address: Option<IpAddr>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -222,6 +333,20 @@ impl SerializableHeaderMap {
     }
 }
 
+/// Get a cloned copy of the `Referer` header as a `String` (if it exists and is valid UTF-8).
+pub fn get_referer(header_map: &Option<Box<SerializableHeaderMap>>) -> Option<String> {
+    match header_map {
+        Some(header_map) => {
+            header_map
+                .0
+                .get(crate::client::header::REFERER) // Retrieves the "Referer" HeaderValue if it exists
+                .and_then(|value| value.to_str().ok()) // &str from HeaderValue
+                .map(String::from) // Convert &str to String (owned)
+        }
+        _ => None,
+    }
+}
+
 impl From<HeaderMap> for SerializableHeaderMap {
     fn from(header_map: HeaderMap) -> Self {
         SerializableHeaderMap(header_map)
@@ -252,7 +377,7 @@ impl<'de> serde::Deserialize<'de> for SerializableHeaderMap {
         use reqwest::header::{HeaderName, HeaderValue};
         use std::collections::BTreeMap;
         let map: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
-        let mut headers = HeaderMap::new();
+        let mut headers = HeaderMap::with_capacity(map.len());
         for (k, v) in map {
             let key = HeaderName::from_bytes(k.as_bytes()).map_err(serde::de::Error::custom)?;
             let value = HeaderValue::from_str(&v).map_err(serde::de::Error::custom)?;
@@ -334,9 +459,11 @@ impl Configuration {
     pub fn new() -> Self {
         Self {
             delay: 0,
+            depth: 25,
             redirect_limit: Box::new(7),
-            request_timeout: Some(Box::new(Duration::from_secs(15))),
+            request_timeout: Some(Box::new(Duration::from_secs(60))),
             only_html: true,
+            modify_headers: true,
             ..Default::default()
         }
     }
@@ -346,14 +473,37 @@ impl Configuration {
     pub fn new() -> Self {
         Self {
             delay: 0,
+            depth: 25,
             redirect_limit: Box::new(7),
-            request_timeout: Some(Box::new(Duration::from_secs(15))),
+            request_timeout: Some(Box::new(Duration::from_secs(60))),
             chrome_intercept: RequestInterceptConfiguration::new(cfg!(
                 feature = "chrome_intercept"
             )),
+            user_agent: Some(Box::new(get_ua(true).into())),
             only_html: true,
+            cache: true,
+            modify_headers: true,
+            service_worker_enabled: true,
+            fingerprint: Fingerprint::Basic,
+            auto_geolocation: false,
             ..Default::default()
         }
+    }
+
+    /// Determine if the agent should be set to a Chrome Agent.
+    #[cfg(not(feature = "chrome"))]
+    pub(crate) fn only_chrome_agent(&self) -> bool {
+        false
+    }
+
+    /// Determine if the agent should be set to a Chrome Agent.
+    #[cfg(feature = "chrome")]
+    pub(crate) fn only_chrome_agent(&self) -> bool {
+        self.chrome_connection_url.is_some()
+            || self.wait_for.is_some()
+            || self.chrome_intercept.enabled
+            || self.stealth_mode.stealth()
+            || self.fingerprint.valid()
     }
 
     #[cfg(feature = "regex")]
@@ -370,7 +520,7 @@ impl Configuration {
 
     #[cfg(not(feature = "regex"))]
     /// Handle the blacklist options.
-    pub fn get_blacklist(&self) -> Box<Vec<CompactString>> {
+    pub fn get_blacklist(&self) -> AllowList {
         match &self.blacklist_url {
             Some(blacklist) => blacklist.to_owned(),
             _ => Default::default(),
@@ -422,10 +572,65 @@ impl Configuration {
 
     #[cfg(not(feature = "regex"))]
     /// Handle the whitelist options.
-    pub fn get_whitelist(&self) -> Box<Vec<CompactString>> {
+    pub fn get_whitelist(&self) -> AllowList {
         match &self.whitelist_url {
             Some(whitelist) => whitelist.to_owned(),
             _ => Default::default(),
+        }
+    }
+
+    #[cfg(feature = "sitemap")]
+    /// Add sitemap paths to the whitelist and track what was added.
+    pub(crate) fn add_sitemap_to_whitelist(&mut self) -> SitemapWhitelistChanges {
+        let mut changes = SitemapWhitelistChanges::default();
+
+        if self.ignore_sitemap && !self.whitelist_url.is_some() {
+            return changes;
+        }
+
+        if let Some(list) = self.whitelist_url.as_mut() {
+            if list.is_empty() {
+                return changes;
+            }
+
+            let default = CompactString::from("sitemap.xml");
+
+            if !list.contains(&default) {
+                list.push(default);
+                changes.added_default = true;
+            }
+
+            if let Some(custom) = &self.sitemap_url {
+                if !list.contains(custom) {
+                    list.push(*custom.clone());
+                    changes.added_custom = true;
+                }
+            }
+        }
+
+        changes
+    }
+
+    #[cfg(feature = "sitemap")]
+    /// Revert any changes made to the whitelist by `add_sitemap_to_whitelist`.
+    pub(crate) fn remove_sitemap_from_whitelist(&mut self, changes: SitemapWhitelistChanges) {
+        if let Some(list) = self.whitelist_url.as_mut() {
+            if changes.added_default {
+                let default = CompactString::from("sitemap.xml");
+                if let Some(pos) = list.iter().position(|s| s == &default) {
+                    list.remove(pos);
+                }
+            }
+            if changes.added_custom {
+                if let Some(custom) = &self.sitemap_url {
+                    if let Some(pos) = list.iter().position(|s| *s == **custom) {
+                        list.remove(pos);
+                    }
+                }
+            }
+            if list.is_empty() {
+                self.whitelist_url = None;
+            }
         }
     }
 
@@ -441,9 +646,40 @@ impl Configuration {
         self
     }
 
+    /// Bypass CSP protection detection. This does nothing without the feat flag `chrome` enabled.
+    #[cfg(feature = "chrome")]
+    pub fn with_csp_bypass(&mut self, enabled: bool) -> &mut Self {
+        self.bypass_csp = enabled;
+        self
+    }
+
+    /// Bypass CSP protection detection. This does nothing without the feat flag `chrome` enabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_csp_bypass(&mut self, _enabled: bool) -> &mut Self {
+        self
+    }
+
+    /// Bind the connections only on the network interface.
+    pub fn with_network_interface(&mut self, network_interface: Option<String>) -> &mut Self {
+        self.network_interface = network_interface;
+        self
+    }
+
+    /// Bind to a local IP Address.
+    pub fn with_local_address(&mut self, local_address: Option<IpAddr>) -> &mut Self {
+        self.local_address = local_address;
+        self
+    }
+
     /// Include tld detection.
     pub fn with_tld(&mut self, tld: bool) -> &mut Self {
         self.tld = tld;
+        self
+    }
+
+    /// The max duration for the crawl. This is useful when websites use a robots.txt with long durations and throttle the timeout removing the full concurrency.
+    pub fn with_crawl_timeout(&mut self, crawl_timeout: Option<Duration>) -> &mut Self {
+        self.crawl_timeout = crawl_timeout;
         self
     }
 
@@ -525,7 +761,7 @@ impl Configuration {
     #[cfg(feature = "openai")]
     pub fn with_openai(&mut self, openai_config: Option<GPTConfigs>) -> &mut Self {
         match openai_config {
-            Some(openai_config) => self.openai_config = Some(openai_config),
+            Some(openai_config) => self.openai_config = Some(Box::new(openai_config)),
             _ => self.openai_config = None,
         };
         self
@@ -547,6 +783,17 @@ impl Configuration {
     #[cfg(feature = "chrome")]
     /// Set custom fingerprint ID for request. This does nothing without the `chrome` flag enabled.
     pub fn with_fingerprint(&mut self, fingerprint: bool) -> &mut Self {
+        if fingerprint {
+            self.fingerprint = Fingerprint::Basic;
+        } else {
+            self.fingerprint = Fingerprint::None;
+        }
+        self
+    }
+
+    #[cfg(feature = "chrome")]
+    /// Set custom fingerprint ID for request. This does nothing without the `chrome` flag enabled.
+    pub fn with_fingerprint_advanced(&mut self, fingerprint: Fingerprint) -> &mut Self {
         self.fingerprint = fingerprint;
         self
     }
@@ -559,10 +806,20 @@ impl Configuration {
 
     /// Use proxies for request.
     pub fn with_proxies(&mut self, proxies: Option<Vec<String>>) -> &mut Self {
-        match proxies {
-            Some(p) => self.proxies = Some(p.into()),
-            _ => self.proxies = None,
-        };
+        self.proxies = proxies.map(|p| {
+            p.iter()
+                .map(|addr| RequestProxy {
+                    addr: addr.to_owned(),
+                    ..Default::default()
+                })
+                .collect::<Vec<RequestProxy>>()
+        });
+        self
+    }
+
+    /// Use proxies for request with control between chrome and http.
+    pub fn with_proxies_direct(&mut self, proxies: Option<Vec<RequestProxy>>) -> &mut Self {
+        self.proxies = proxies;
         self
     }
 
@@ -578,7 +835,7 @@ impl Configuration {
         Vec<CompactString>: From<Vec<T>>,
     {
         match blacklist_url {
-            Some(p) => self.blacklist_url = Some(Box::new(p.into())),
+            Some(p) => self.blacklist_url = Some(p.into()),
             _ => self.blacklist_url = None,
         };
         self
@@ -590,7 +847,7 @@ impl Configuration {
         Vec<CompactString>: From<Vec<T>>,
     {
         match whitelist_url {
-            Some(p) => self.whitelist_url = Some(Box::new(p.into())),
+            Some(p) => self.whitelist_url = Some(p.into()),
             _ => self.whitelist_url = None,
         };
         self
@@ -626,6 +883,26 @@ impl Configuration {
     /// Determine whether to collect all the resources found on pages.
     pub fn with_full_resources(&mut self, full_resources: bool) -> &mut Self {
         self.full_resources = full_resources;
+        self
+    }
+
+    /// Determine whether to dismiss dialogs. This method does nothing if the `chrome` is enabled.
+    #[cfg(feature = "chrome")]
+    pub fn with_dismiss_dialogs(&mut self, dismiss_dialogs: bool) -> &mut Self {
+        self.dismiss_dialogs = Some(dismiss_dialogs);
+        self
+    }
+
+    /// Determine whether to dismiss dialogs. This method does nothing if the `chrome` is enabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_dismiss_dialogs(&mut self, _dismiss_dialogs: bool) -> &mut Self {
+        self
+    }
+
+    /// Set the request emuluation. This method does nothing if the `wreq` flag is not enabled.
+    #[cfg(feature = "wreq")]
+    pub fn with_emulation(&mut self, emulation: Option<wreq_util::Emulation>) -> &mut Self {
+        self.emulation = emulation;
         self
     }
 
@@ -712,12 +989,29 @@ impl Configuration {
         self
     }
 
-    /// Configures the view port for chrome. This method does nothing if the `chrome` feature is not enabled.
+    #[cfg(feature = "chrome")]
+    /// Enable or disable Service Workers. This method does nothing if the `chrome` feature is not enabled.
+    pub fn with_service_worker_enabled(&mut self, enabled: bool) -> &mut Self {
+        self.service_worker_enabled = enabled;
+        self
+    }
+
     #[cfg(not(feature = "chrome"))]
-    pub fn with_viewport(
-        &mut self,
-        _viewport: Option<crate::configuration::Viewport>,
-    ) -> &mut Self {
+    /// Enable or disable Service Workers. This method does nothing if the `chrome` feature is not enabled.
+    pub fn with_service_worker_enabled(&mut self, _enabled: bool) -> &mut Self {
+        self
+    }
+
+    /// Automatically setup geo-location configurations when using a proxy. This method does nothing if the `chrome` feature is not enabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_auto_geolocation(&mut self, _enabled: bool) -> &mut Self {
+        self
+    }
+
+    /// Automatically setup geo-location configurations when using a proxy. This method does nothing if the `chrome` feature is not enabled.
+    #[cfg(feature = "chrome")]
+    pub fn with_auto_geolocation(&mut self, enabled: bool) -> &mut Self {
+        self.auto_geolocation = enabled;
         self
     }
 
@@ -727,8 +1021,13 @@ impl Configuration {
         self
     }
 
+    /// Skip setting up a control thread for pause, start, and shutdown programmatic handling. This does nothing without the [control] flag enabled.
+    pub fn with_no_control_thread(&mut self, no_control_thread: bool) -> &mut Self {
+        self.no_control_thread = no_control_thread;
+        self
+    }
+
     /// Configures the viewport of the browser, which defaults to 800x600. This method does nothing if the [chrome] feature is not enabled.
-    #[cfg(feature = "chrome")]
     pub fn with_viewport(&mut self, viewport: Option<crate::configuration::Viewport>) -> &mut Self {
         self.viewport = match viewport {
             Some(vp) => Some(vp.into()),
@@ -740,6 +1039,20 @@ impl Configuration {
     #[cfg(feature = "chrome")]
     /// Use stealth mode for the request. This does nothing without the `chrome` flag enabled.
     pub fn with_stealth(&mut self, stealth_mode: bool) -> &mut Self {
+        if stealth_mode {
+            self.stealth_mode = spider_fingerprint::configs::Tier::Basic;
+        } else {
+            self.stealth_mode = spider_fingerprint::configs::Tier::None;
+        }
+        self
+    }
+
+    #[cfg(feature = "chrome")]
+    /// Use stealth mode for the request. This does nothing without the `chrome` flag enabled.
+    pub fn with_stealth_advanced(
+        &mut self,
+        stealth_mode: spider_fingerprint::configs::Tier,
+    ) -> &mut Self {
         self.stealth_mode = stealth_mode;
         self
     }
@@ -794,7 +1107,7 @@ impl Configuration {
     }
 
     #[cfg(not(feature = "chrome"))]
-    /// Wait for idle dom mutations for target element. This method does nothing if the [chrome] feature is not enabled.
+    /// Wait for idle dom mutations for target element. This method does nothing if the `chrome` feature is not enabled.
     pub fn with_wait_for_idle_dom(
         &mut self,
         _wait_for_idle_dom: Option<WaitForSelector>,
@@ -803,7 +1116,7 @@ impl Configuration {
     }
 
     #[cfg(feature = "chrome")]
-    /// Wait for a selector. This method does nothing if the [chrome] feature is not enabled.
+    /// Wait for a selector. This method does nothing if the `chrome` feature is not enabled.
     pub fn with_wait_for_selector(
         &mut self,
         wait_for_selector: Option<WaitForSelector>,
@@ -959,9 +1272,12 @@ impl Configuration {
                         if d == "*" {
                             Some("*".into())
                         } else {
-                            match url::Url::parse(&d) {
-                                Ok(d) => Some(d.host_str().unwrap_or_default().into()),
-                                _ => None,
+                            let host = get_domain_from_url(&d);
+
+                            if !host.is_empty() {
+                                Some(host.into())
+                            } else {
+                                None
                             }
                         }
                     })
@@ -977,6 +1293,12 @@ impl Configuration {
     /// Dangerously accept invalid certificates - this should be used as a last resort.
     pub fn with_danger_accept_invalid_certs(&mut self, accept_invalid_certs: bool) -> &mut Self {
         self.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Normalize the content de-duplicating trailing slash pages and other pages that can be duplicated. This may initially show the link in your links_visited or subscription calls but, the following links will not be crawled.
+    pub fn with_normalize(&mut self, normalize: bool) -> &mut Self {
+        self.normalize = normalize;
         self
     }
 
@@ -1012,6 +1334,13 @@ impl Configuration {
         self
     }
 
+    #[cfg(feature = "chrome")]
+    /// Track the events made via chrome.
+    pub fn with_event_tracker(&mut self, track_events: Option<ChromeEventTracker>) -> &mut Self {
+        self.track_events = track_events;
+        self
+    }
+
     /// Set the chrome screenshot configuration. This does nothing without the `chrome` flag enabled.
     #[cfg(not(feature = "chrome"))]
     pub fn with_screenshot(&mut self, _screenshot_config: Option<ScreenShotConfig>) -> &mut Self {
@@ -1025,9 +1354,21 @@ impl Configuration {
         self
     }
 
-    /// Block assets from loading from the network
+    /// Set the max amount of bytes to collect per page. Only used for chrome atm.
+    pub fn with_max_page_bytes(&mut self, max_page_bytes: Option<f64>) -> &mut Self {
+        self.max_page_bytes = max_page_bytes;
+        self
+    }
+
+    /// Block assets from loading from the network.
     pub fn with_block_assets(&mut self, only_html: bool) -> &mut Self {
         self.only_html = only_html;
+        self
+    }
+
+    /// Modify the headers to mimic a real browser.
+    pub fn with_modify_headers(&mut self, modify_headers: bool) -> &mut Self {
+        self.modify_headers = modify_headers;
         self
     }
 

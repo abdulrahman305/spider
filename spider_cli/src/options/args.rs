@@ -4,6 +4,7 @@ use clap::Parser;
 /// program to crawl a website and gather valid web urls.
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
+#[command(arg_required_else_help = true)]
 pub struct Cli {
     /// Build main sub commands
     #[clap(subcommand)]
@@ -20,6 +21,9 @@ pub struct Cli {
     /// Allow all tlds for domain.
     #[clap(short, long)]
     pub tld: bool,
+    #[clap(short, long)]
+    /// Return the headers of the page.  Requires the `headers` flag enabled.
+    pub return_headers: bool,
     /// Print page visited on standard output
     #[clap(short, long)]
     pub verbose: bool,
@@ -50,4 +54,7 @@ pub struct Cli {
     /// Dangerously accept invalid certficates
     #[clap(long)]
     pub accept_invalid_certs: bool,
+    /// Gather all content that relates to the domain like css,jss, and etc.
+    #[clap(long)]
+    pub full_resources: bool,
 }

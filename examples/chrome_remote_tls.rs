@@ -1,7 +1,4 @@
-//! cargo run --example chrome_remote --features="chrome chrome_intercept"
-
-// May 11th, 2025: Highly recommend you use the headless-browser project ( https://github.com/spider-rs/headless-browser/tree/main ) for remote Chrome.
-//                 See https://github.com/spider-rs/spider/issues/294#issuecomment-2869870886
+//! cargo run --example chrome_remote_tls --features="chrome chrome_intercept chrome_tls_connection"
 
 extern crate spider;
 use crate::spider::tokio::io::AsyncWriteExt;
@@ -17,7 +14,9 @@ async fn crawl_website(url: &str) -> Result<()> {
         .with_stealth(true)
         .with_fingerprint(true)
         // .with_proxies(Some(vec!["http://localhost:8888".into()]))
-        .with_chrome_connection(Some("http://127.0.0.1:9222/json/version".into()))
+        .with_chrome_connection(Some(
+            "wss://replace_this_with_your_connection_string".into(),
+        ))
         .build()
         .unwrap();
 
@@ -59,8 +58,6 @@ async fn crawl_website(url: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
-
     let _ = tokio::join!(
         crawl_website("https://choosealicense.com"),
         crawl_website("https://jeffmendez.com"),

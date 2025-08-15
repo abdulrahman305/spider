@@ -1,15 +1,11 @@
-use spider::lazy_static::lazy_static;
-use spider::packages::scraper::ElementRef;
-use spider::tokio_stream::StreamExt;
-use spider::utils::log;
-use spider::{
-    hashbrown::{hash_map::Entry, HashMap},
-    packages::scraper::{Html, Selector},
-    tokio,
-};
+use hashbrown::{hash_map::Entry, HashMap};
+use lazy_static::lazy_static;
+use log::{self, warn};
+use scraper::{ElementRef, Html, Selector};
 use std::{fmt::Debug, hash::Hash};
 use sxd_document::parser;
 use sxd_xpath::evaluate_xpath;
+use tokio_stream::StreamExt;
 
 /// The type of selectors that can be used to query.
 #[derive(Default, Debug, Clone)]
@@ -20,18 +16,16 @@ pub struct DocumentSelectors<K> {
     pub xpath: HashMap<K, Vec<String>>,
 }
 
-#[cfg(feature = "transformations")]
-pub use spider_transformations;
-
 /// Extracted content from CSS query selectors.
 type CSSQueryMap = HashMap<String, Vec<String>>;
 
+lazy_static! {
+    /// Xpath factory.
+    static ref XPATH_FACTORY: sxd_xpath::Factory = sxd_xpath::Factory::new();
+}
+
 /// Check if a selector is a valid xpath
 fn is_valid_xpath(expression: &str) -> bool {
-    use sxd_xpath::Factory;
-    lazy_static! {
-        static ref XPATH_FACTORY: Factory = Factory::new();
-    };
     match XPATH_FACTORY.build(expression) {
         Ok(Some(_)) => true,
         Ok(None) => false,
@@ -50,8 +44,8 @@ where
     let mut map: CSSQueryMap = HashMap::new();
 
     if !selectors.css.is_empty() {
-        let mut stream = spider::tokio_stream::iter(&selectors.css);
-        let fragment = Box::new(Html::parse_fragment(html));
+        let mut stream = tokio_stream::iter(&selectors.css);
+        let fragment = Box::new(Html::parse_document(html));
 
         while let Some(selector) = stream.next().await {
             for s in selector.1 {
@@ -100,7 +94,7 @@ where
     let mut map: CSSQueryMap = HashMap::new();
 
     if !selectors.css.is_empty() {
-        let fragment = Box::new(Html::parse_fragment(html));
+        let fragment = Box::new(Html::parse_document(html));
 
         for selector in selectors.css.iter() {
             for s in selector.1 {
@@ -138,21 +132,55 @@ where
 }
 
 /// Process a single element and update the map with the results.
-fn process_selector<K>(element: ElementRef, selector: &K, map: &mut CSSQueryMap)
+fn process_selector<K>(element: ElementRef, name: &K, map: &mut CSSQueryMap)
 where
     K: AsRef<str> + Eq + Hash + Sized,
 {
-    let name = selector.as_ref();
-    let entry_name = if name.is_empty() {
-        Default::default()
+    let name = name.as_ref();
+    let element_name = element.value().name();
+
+    let text = if element_name == "meta" {
+        element.attr("content").unwrap_or_default().into()
+    } else if element_name == "link" || element_name == "script" || element_name == "styles" {
+        match element.attr(if element_name == "link" {
+            "href"
+        } else {
+            "src"
+        }) {
+            Some(href) => href.into(),
+            _ => clean_element_text(&element),
+        }
+    } else if element_name == "img" || element_name == "source" {
+        let mut img_text = String::new();
+
+        if let Some(src) = element.attr("src") {
+            if !src.is_empty() {
+                img_text.push('[');
+                img_text.push_str(src.trim());
+                img_text.push(']');
+            }
+        }
+        if let Some(alt) = element.attr("alt") {
+            if !alt.is_empty() {
+                if img_text.is_empty() {
+                    img_text.push_str(alt);
+                } else {
+                    img_text.push('(');
+                    img_text.push('"');
+                    img_text.push_str(alt);
+                    img_text.push('"');
+                    img_text.push(')');
+                }
+            }
+        }
+
+        img_text
     } else {
-        name.to_string()
+        clean_element_text(&element)
     };
 
-    let text = clean_element_text(&element);
-
     if !text.is_empty() {
-        match map.entry(entry_name) {
+        match map.entry(name.to_string()) {
             Entry::Occupied(mut entry) => entry.get_mut().push(text),
             Entry::Vacant(entry) => {
                 entry.insert(vec![text]);
@@ -187,8 +215,8 @@ where
                     if is_valid_xpath(selector_str.as_ref()) {
                         selectors_vec_xpath.push(selector_str.as_ref().to_string())
                     } else {
-                        log(
-                            "",
+                        warn!(
+                            "{}",
                             format!(
                                 "Failed to parse selector '{}': {:?}",
                                 selector_str.as_ref(),
@@ -225,14 +253,12 @@ where
 
 /// Build valid css selectors for extracting. The hashmap takes items with the key for the object key and the value is the css selector.
 #[cfg(not(feature = "indexset"))]
-pub fn build_selectors<K, V>(
-    selectors: HashMap<K, spider::hashbrown::HashSet<V>>,
-) -> DocumentSelectors<K>
+pub fn build_selectors<K, V>(selectors: HashMap<K, hashbrown::HashSet<V>>) -> DocumentSelectors<K>
 where
     K: AsRef<str> + Eq + Hash + Clone + Debug,
     V: AsRef<str> + Debug + AsRef<str>,
 {
-    build_selectors_base::<K, V, spider::hashbrown::HashSet<V>>(selectors)
+    build_selectors_base::<K, V, hashbrown::HashSet<V>>(selectors)
 }
 
 /// Build valid css selectors for extracting. The hashmap takes items with the key for the object key and the value is the css selector.
@@ -246,7 +272,7 @@ where
 }
 
 #[cfg(not(feature = "indexset"))]
-pub type QueryCSSSelectSet<'a> = spider::hashbrown::HashSet<&'a str>;
+pub type QueryCSSSelectSet<'a> = hashbrown::HashSet<&'a str>;
 #[cfg(feature = "indexset")]
 pub type QueryCSSSelectSet<'a> = indexmap::IndexSet<&'a str>;
 #[cfg(not(feature = "indexset"))]
@@ -254,6 +280,7 @@ pub type QueryCSSMap<'a> = HashMap<&'a str, QueryCSSSelectSet<'a>>;
 #[cfg(feature = "indexset")]
 pub type QueryCSSMap<'a> = HashMap<&'a str, QueryCSSSelectSet<'a>>;
 
+#[cfg(test)]
 #[tokio::test]
 async fn test_css_query_select_map_streamed() {
     let map = QueryCSSMap::from([("list", QueryCSSSelectSet::from([".list", ".sub-list"]))]);
@@ -278,6 +305,7 @@ fn test_css_query_select_map() {
     assert!(!data.is_empty(), "CSS extraction failed",);
 }
 
+#[cfg(test)]
 #[tokio::test]
 async fn test_css_query_select_map_streamed_multi_join() {
     let map = QueryCSSMap::from([("list", QueryCSSSelectSet::from([".list", ".sub-list"]))]);
@@ -295,6 +323,7 @@ async fn test_css_query_select_map_streamed_multi_join() {
     assert!(!data.is_empty(), "CSS extraction failed");
 }
 
+#[cfg(test)]
 #[tokio::test]
 async fn test_xpath_query_select_map_streamed() {
     let map = QueryCSSMap::from([(

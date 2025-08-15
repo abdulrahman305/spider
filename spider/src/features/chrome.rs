@@ -1,19 +1,32 @@
+use crate::features::chrome_args::CHROME_ARGS;
 use crate::utils::log;
 use crate::{configuration::Configuration, tokio_stream::StreamExt};
-use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
-use chromiumoxide::cdp::browser_protocol::network::CookieParam;
-use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
+use chromiumoxide::cdp::browser_protocol::browser::{
+    SetDownloadBehaviorBehavior, SetDownloadBehaviorParamsBuilder,
+};
+use chromiumoxide::cdp::browser_protocol::{
+    browser::BrowserContextId, emulation::SetGeolocationOverrideParams, network::CookieParam,
+    target::CreateTargetParams,
+};
 use chromiumoxide::error::CdpError;
-use chromiumoxide::page::DISABLE_DIALOGS;
+use chromiumoxide::handler::REQUEST_TIMEOUT;
+use chromiumoxide::serde_json;
 use chromiumoxide::Page;
 use chromiumoxide::{handler::HandlerConfig, Browser, BrowserConfig};
-use reqwest::cookie::CookieStore;
-use reqwest::cookie::Jar;
+use lazy_static::lazy_static;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use url::Url;
 
-/// parse a cookie into a jar
+lazy_static! {
+    /// Enable loopback for proxy.
+    static ref LOOP_BACK_PROXY: bool = std::env::var("LOOP_BACK_PROXY").unwrap_or_default() == "true";
+}
+
+#[cfg(feature = "cookies")]
+/// Parse a cookie into a jar. This does nothing without the 'cookies' flag.
 pub fn parse_cookies_with_jar(cookie_str: &str, url: &Url) -> Result<Vec<CookieParam>, String> {
+    use reqwest::cookie::{CookieStore, Jar};
     let jar = Jar::default();
 
     jar.add_cookie_str(cookie_str, url);
@@ -66,10 +79,16 @@ pub fn parse_cookies_with_jar(cookie_str: &str, url: &Url) -> Result<Vec<CookieP
     }
 }
 
+/// Parse a cookie into a jar. This does nothing without the 'cookies' flag.
+#[cfg(not(feature = "cookies"))]
+pub fn parse_cookies_with_jar(cookie_str: &str, url: &Url) -> Result<Vec<CookieParam>, String> {
+    Ok(Default::default())
+}
+
 /// get chrome configuration
 #[cfg(not(feature = "chrome_headed"))]
 pub fn get_browser_config(
-    proxies: &Option<Box<Vec<string_concat::String>>>,
+    proxies: &Option<Vec<crate::configuration::RequestProxy>>,
     intercept: bool,
     cache_enabled: bool,
     viewport: impl Into<Option<chromiumoxide::handler::viewport::Viewport>>,
@@ -79,7 +98,7 @@ pub fn get_browser_config(
         .disable_default_args()
         .request_timeout(match request_timeout.as_ref() {
             Some(timeout) => **timeout,
-            _ => Default::default(),
+            _ => Duration::from_millis(REQUEST_TIMEOUT),
         });
 
     let builder = if cache_enabled {
@@ -98,8 +117,20 @@ pub fn get_browser_config(
     let builder = match proxies {
         Some(proxies) => {
             let mut chrome_args = Vec::from(CHROME_ARGS.map(|e| e.replace("://", "=").to_string()));
+            let base_proxies = proxies
+                .iter()
+                .filter_map(|p| {
+                    if p.ignore == crate::configuration::ProxyIgnore::Chrome {
+                        None
+                    } else {
+                        Some(p.addr.to_owned())
+                    }
+                })
+                .collect::<Vec<String>>();
 
-            chrome_args.push(string_concat!(r#"--proxy-server="#, proxies.join(";")));
+            if !base_proxies.is_empty() {
+                chrome_args.push(string_concat!(r#"--proxy-server="#, base_proxies.join(";")));
+            }
 
             builder.args(chrome_args)
         }
@@ -126,7 +157,7 @@ pub fn get_browser_config(
 /// get chrome configuration headful
 #[cfg(feature = "chrome_headed")]
 pub fn get_browser_config(
-    proxies: &Option<Box<Vec<string_concat::String>>>,
+    proxies: &Option<Vec<crate::configuration::RequestProxy>>,
     intercept: bool,
     cache_enabled: bool,
     viewport: impl Into<Option<chromiumoxide::handler::viewport::Viewport>>,
@@ -137,7 +168,7 @@ pub fn get_browser_config(
         .no_sandbox()
         .request_timeout(match request_timeout.as_ref() {
             Some(timeout) => **timeout,
-            _ => Default::default(),
+            _ => Duration::from_millis(REQUEST_TIMEOUT),
         })
         .with_head();
 
@@ -163,7 +194,18 @@ pub fn get_browser_config(
 
     let builder = match proxies {
         Some(proxies) => {
-            chrome_args.push(string_concat!(r#"--proxy-server="#, proxies.join(";")));
+            let base_proxies = proxies
+                .iter()
+                .filter_map(|p| {
+                    if p.ignore == crate::configuration::ProxyIgnore::Chrome {
+                        None
+                    } else {
+                        Some(p.addr.to_owned())
+                    }
+                })
+                .collect::<Vec<String>>();
+
+            chrome_args.push(string_concat!(r#"--proxy-server="#, base_proxies.join(";")));
 
             builder.args(chrome_args)
         }
@@ -191,10 +233,11 @@ fn create_handler_config(config: &Configuration) -> HandlerConfig {
     HandlerConfig {
         request_timeout: match config.request_timeout.as_ref() {
             Some(timeout) => **timeout,
-            _ => Default::default(),
+            _ => Duration::from_millis(REQUEST_TIMEOUT),
         },
         request_intercept: config.chrome_intercept.enabled,
         cache_enabled: config.cache,
+        service_worker_enabled: config.service_worker_enabled,
         viewport: match config.viewport {
             Some(ref v) => Some(chromiumoxide::handler::viewport::Viewport::from(
                 v.to_owned(),
@@ -208,7 +251,12 @@ fn create_handler_config(config: &Configuration) -> HandlerConfig {
         ignore_stylesheets: config.chrome_intercept.block_stylesheets,
         extra_headers: match config.headers {
             Some(ref headers) => {
-                let hm = crate::utils::header_utils::header_map_to_hash_map(headers.inner());
+                let mut hm = crate::utils::header_utils::header_map_to_hash_map(headers.inner());
+
+                if cfg!(feature = "real_browser") {
+                    crate::utils::header_utils::rewrite_headers_to_title_case(&mut hm);
+                }
+
                 if hm.is_empty() {
                     None
                 } else {
@@ -255,13 +303,33 @@ pub async fn setup_browser_configuration(
     };
 
     match chrome_connection {
-        Some(v) => match Browser::connect_with_config(&*v, create_handler_config(&config)).await {
-            Ok(browser) => Some(browser),
-            Err(err) => {
-                log::error!("{:?}", err);
-                None
+        Some(v) => {
+            let mut attempts = 0;
+            let max_retries = 10;
+            let mut browser = None;
+
+            // Attempt reconnections for instances that may be on load balancers (LBs)
+            // experiencing shutdowns or degradation. This logic implements a retry
+            // mechanism to improve robustness by allowing multiple attempts to establish.
+            while attempts <= max_retries {
+                match Browser::connect_with_config(&*v, create_handler_config(&config)).await {
+                    Ok(b) => {
+                        browser = Some(b);
+                        break;
+                    }
+                    Err(err) => {
+                        log::error!("{:?}", err);
+                        attempts += 1;
+                        if attempts > max_retries {
+                            log::error!("Exceeded maximum retry attempts");
+                            break;
+                        }
+                    }
+                }
             }
-        },
+
+            browser
+        }
         _ => match get_browser_config(
             &proxies,
             config.chrome_intercept.enabled,
@@ -282,8 +350,10 @@ pub async fn setup_browser_configuration(
                 browser_config.ignore_analytics = config.chrome_intercept.block_analytics;
                 browser_config.extra_headers = match config.headers {
                     Some(ref headers) => {
-                        let hm =
+                        let mut hm =
                             crate::utils::header_utils::header_map_to_hash_map(headers.inner());
+                        crate::utils::header_utils::rewrite_headers_to_title_case(&mut hm);
+
                         if hm.is_empty() {
                             None
                         } else {
@@ -314,116 +384,296 @@ pub async fn launch_browser(
     tokio::task::JoinHandle<()>,
     Option<BrowserContextId>,
 )> {
-    use chromiumoxide::cdp::browser_protocol::target::CreateBrowserContextParams;
-    use chromiumoxide::error::CdpError;
+    use chromiumoxide::{
+        cdp::browser_protocol::target::CreateBrowserContextParams, error::CdpError,
+    };
+
     let browser_configuration = setup_browser_configuration(&config).await;
-    let mut context_id = None;
 
     match browser_configuration {
         Some(c) => {
-            let (mut browser, handler) = c;
-
-            context_id.clone_from(&handler.default_browser_context().id().cloned());
+            let (mut browser, mut handler) = c;
+            let mut context_id = None;
 
             // Spawn a new task that continuously polls the handler
+            // we might need a select with closing in case handler stalls.
             let handle = tokio::task::spawn(async move {
-                tokio::pin!(handler);
-                loop {
-                    match handler.next().await {
-                        Some(k) => {
-                            if let Err(e) = k {
-                                match e {
-                                    CdpError::LaunchExit(_, _)
-                                    | CdpError::LaunchTimeout(_)
-                                    | CdpError::LaunchIo(_, _) => {
-                                        break;
-                                    }
-                                    _ => {
-                                        continue;
-                                    }
-                                }
+                while let Some(k) = handler.next().await {
+                    if let Err(e) = k {
+                        match e {
+                            CdpError::Ws(_)
+                            | CdpError::LaunchExit(_, _)
+                            | CdpError::LaunchTimeout(_)
+                            | CdpError::LaunchIo(_, _) => {
+                                break;
+                            }
+                            _ => {
+                                continue;
                             }
                         }
-                        _ => break,
                     }
                 }
             });
 
-            if !context_id.is_some() {
-                let mut create_content = CreateBrowserContextParams::default();
-                create_content.dispose_on_detach = Some(true);
+            let mut create_content = CreateBrowserContextParams::default();
+            create_content.dispose_on_detach = Some(true);
 
-                if let Some(ref p) = config.proxies {
-                    if let Some(p) = p.get(0) {
-                        if p.starts_with("http://localhost") {
-                            create_content.proxy_bypass_list = Some("<-loopback>".into());
+            if let Some(ref proxies) = config.proxies {
+                let use_plain_http = proxies.len() >= 2;
+
+                for proxie in proxies.iter() {
+                    if proxie.ignore == crate::configuration::ProxyIgnore::Chrome {
+                        continue;
+                    }
+
+                    let proxie = &proxie.addr;
+
+                    if !proxie.is_empty() {
+                        // pick the socks:// proxy over http if found.
+                        if proxie.starts_with("socks://") {
+                            create_content.proxy_server =
+                                Some(proxie.replacen("socks://", "http://", 1).into());
+                            // pref this connection
+                            if use_plain_http {
+                                break;
+                            }
                         }
-                        create_content.proxy_server = Some(p.into());
+
+                        if *LOOP_BACK_PROXY && proxie.starts_with("http://localhost") {
+                            create_content.proxy_bypass_list =
+                                    // https://source.chromium.org/chromium/chromium/src/+/main:net/proxy_resolution/proxy_bypass_rules.cc
+                                    Some("<-loopback>;localhost;[::1]".into());
+                        }
+
+                        create_content.proxy_server = Some(proxie.into());
                     }
                 }
+            }
 
-                match browser.create_browser_context(create_content).await {
-                    Ok(c) => {
-                        let _ = browser.send_new_context(c.clone()).await;
-                        let _ = context_id.insert(c);
-                        if !config.cookie_str.is_empty() {
-                            if let Some(parsed) = url_parsed {
-                                let cookies = parse_cookies_with_jar(&config.cookie_str, &*parsed);
-                                if let Ok(co) = cookies {
-                                    let _ = browser.set_cookies(co).await;
-                                };
-                            };
-                        }
-                    }
-                    _ => (),
+            if let Ok(c) = browser.create_browser_context(create_content).await {
+                let _ = browser.send_new_context(c.clone()).await;
+                let _ = context_id.insert(c);
+                if !config.cookie_str.is_empty() {
+                    if let Some(parsed) = url_parsed {
+                        let cookies = parse_cookies_with_jar(&config.cookie_str, &*parsed);
+                        if let Ok(co) = cookies {
+                            let _ = browser.set_cookies(co).await;
+                        };
+                    };
                 }
+
+                if let Some(id) = &browser.browser_context.id {
+                    let cmd = SetDownloadBehaviorParamsBuilder::default();
+
+                    if let Ok(cmd) = cmd
+                        .behavior(SetDownloadBehaviorBehavior::Deny)
+                        .events_enabled(false)
+                        .browser_context_id(id.clone())
+                        .build()
+                    {
+                        let _ = browser.execute(cmd).await;
+                    }
+                }
+            } else {
+                handle.abort();
             }
 
             Some((browser, handle, context_id))
         }
-
         _ => None,
     }
 }
 
-/// configure the browser
+/// Represents IP-based geolocation and network metadata.
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GeoInfo {
+    /// The public IP address detected.
+    pub ip: Option<String>,
+    /// The CIDR network range of the IP.
+    pub network: Option<String>,
+    /// IP version (e.g., "IPv4" or "IPv6").
+    pub version: Option<String>,
+    /// The city associated with the IP.
+    pub city: Option<String>,
+    /// The region (e.g., state or province).
+    pub region: Option<String>,
+    /// Short regional code (e.g., "CA").
+    pub region_code: Option<String>,
+    /// Two-letter country code (e.g., "US").
+    pub country: Option<String>,
+    /// Full country name.
+    pub country_name: Option<String>,
+    /// Same as `country`, often redundant.
+    pub country_code: Option<String>,
+    /// ISO 3166-1 alpha-3 country code (e.g., "USA").
+    pub country_code_iso3: Option<String>,
+    /// Capital of the country.
+    pub country_capital: Option<String>,
+    /// Top-level domain of the country (e.g., ".us").
+    pub country_tld: Option<String>,
+    /// Continent code (e.g., "NA").
+    pub continent_code: Option<String>,
+    /// Whether the country is in the European Union.
+    pub in_eu: Option<bool>,
+    /// Postal or ZIP code.
+    pub postal: Option<String>,
+    /// Approximate latitude of the IP location.
+    pub latitude: Option<f64>,
+    /// Approximate longitude of the IP location.
+    pub longitude: Option<f64>,
+    /// Timezone identifier (e.g., "America/New_York").
+    pub timezone: Option<String>,
+    /// UTC offset string (e.g., "-0400").
+    pub utc_offset: Option<String>,
+    /// Country calling code (e.g., "+1").
+    pub country_calling_code: Option<String>,
+    /// ISO 4217 currency code (e.g., "USD").
+    pub currency: Option<String>,
+    /// Currency name (e.g., "Dollar").
+    pub currency_name: Option<String>,
+    /// Comma-separated preferred language codes.
+    pub languages: Option<String>,
+    /// Country surface area in square kilometers.
+    pub country_area: Option<f64>,
+    /// Approximate country population.
+    pub country_population: Option<u64>,
+    /// ASN (Autonomous System Number) of the IP.
+    pub asn: Option<String>,
+    /// ISP or organization name.
+    pub org: Option<String>,
+}
+
+/// Auto-detect the geo-location.
+#[cfg(feature = "serde")]
+pub async fn detect_geo_info(new_page: &Page) -> Option<GeoInfo> {
+    use rand::prelude::IndexedRandom;
+    let apis = [
+        "https://ipapi.co/json",
+        "https://ipinfo.io/json",
+        "https://ipwho.is/",
+    ];
+
+    let url = apis.choose(&mut rand::rng())?;
+
+    new_page.goto(*url).await.ok()?;
+    new_page.wait_for_navigation().await.ok()?;
+
+    let html = new_page.content().await.ok()?;
+
+    let json_start = html.find("<pre>")? + "<pre>".len();
+    let json_end = html.find("</pre>")?;
+    let json = html.get(json_start..json_end)?.trim();
+
+    serde_json::from_str(json).ok()
+}
+
+#[cfg(not(feature = "serde"))]
+/// Auto-detect the geo-location.
+pub async fn detect_geo_info(new_page: &Page) -> Option<GeoInfo> {
+    None
+}
+
+/// configure the browser.
 pub async fn configure_browser(new_page: &Page, configuration: &Configuration) {
-    let timezone_id = async {
-        match configuration.timezone_id.as_deref() {
-            Some(timezone_id) => {
-                match new_page
+    let mut timezone = configuration.timezone_id.is_some();
+    let mut locale = configuration.locale.is_some();
+
+    let mut timezone_value = configuration.timezone_id.clone();
+    let mut locale_value = configuration.locale.clone();
+
+    let mut emulate_geolocation = None;
+
+    // get the locale of the proxy.
+    if configuration.auto_geolocation && configuration.proxies.is_some() && !timezone && !locale {
+        if let Some(geo) = detect_geo_info(&new_page).await {
+            if let Some(languages) = geo.languages {
+                if let Some(locale_v) = languages.split(',').next() {
+                    if !locale_v.is_empty() {
+                        locale_value = Some(Box::new(locale_v.into()));
+                    }
+                }
+            }
+
+            if let Some(timezone_v) = geo.timezone {
+                if !timezone_v.is_empty() {
+                    timezone_value = Some(Box::new(timezone_v));
+                }
+            }
+
+            timezone = timezone_value.is_some();
+            locale = locale_value.is_some();
+
+            let mut geo_location_override = SetGeolocationOverrideParams::default();
+
+            geo_location_override.latitude = geo.latitude;
+            geo_location_override.longitude = geo.longitude;
+            geo_location_override.accuracy = Some(0.7);
+
+            emulate_geolocation = Some(geo_location_override);
+        }
+    }
+
+    if timezone && locale {
+        let geo = async {
+            if let Some(geolocation) = emulate_geolocation {
+                let _ = new_page.emulate_geolocation(geolocation).await;
+            }
+        };
+        let timezone_id = async {
+            if let Some(timezone_id) = timezone_value.as_deref() {
+                if !timezone_id.is_empty() {
+                    let _ = new_page
                     .emulate_timezone(
                         chromiumoxide::cdp::browser_protocol::emulation::SetTimezoneOverrideParams::new(
                             timezone_id,
                         ),
                     )
-                    .await
-                {
-                    _ => (),
+                    .await;
                 }
             }
-            _ => (),
+        };
+
+        let locale = async {
+            if let Some(locale) = locale_value.as_deref() {
+                if !locale.is_empty() {
+                    let _ = new_page
+                        .emulate_locale(
+                            chromiumoxide::cdp::browser_protocol::emulation::SetLocaleOverrideParams {
+                                locale: Some(locale.into()),
+                            },
+                        )
+                        .await;
+                }
+            }
+        };
+
+        tokio::join!(timezone_id, locale, geo);
+    } else if timezone {
+        if let Some(timezone_id) = timezone_value.as_deref() {
+            if !timezone_id.is_empty() {
+                let _ = new_page
+                    .emulate_timezone(
+                        chromiumoxide::cdp::browser_protocol::emulation::SetTimezoneOverrideParams::new(
+                            timezone_id,
+                        ),
+                    )
+                    .await;
+            }
         }
-    };
-    let locale = async {
-        match configuration.locale.as_deref() {
-            Some(locale) => {
-                match new_page
+    } else if locale {
+        if let Some(locale) = locale_value.as_deref() {
+            if !locale.is_empty() {
+                let _ = new_page
                     .emulate_locale(
                         chromiumoxide::cdp::browser_protocol::emulation::SetLocaleOverrideParams {
                             locale: Some(locale.into()),
                         },
                     )
-                    .await
-                {
-                    _ => (),
-                }
+                    .await;
             }
-            _ => (),
         }
-    };
-
-    tokio::join!(timezone_id, locale);
+    }
 }
 
 /// attempt to navigate to a page respecting the request timeout. This will attempt to get a response for up to 60 seconds. There is a bug in the browser hanging if the CDP connection or handler errors. [https://github.com/mattsse/chromiumoxide/issues/64]
@@ -436,19 +686,29 @@ pub(crate) async fn attempt_navigation(
     viewport: &Option<crate::features::chrome_common::Viewport>,
 ) -> Result<Page, CdpError> {
     let mut cdp_params = CreateTargetParams::new(url);
-    cdp_params.background = Some(browser_context_id.is_some());
+
+    cdp_params.background = Some(browser_context_id.is_some()); // not supported headless-shell
     cdp_params.browser_context_id.clone_from(browser_context_id);
-    cdp_params.url = url.into();
     cdp_params.for_tab = Some(false);
 
-    if let Some(vp) = viewport {
-        if vp.width >= 25 {
-            cdp_params.width = Some(vp.width.into());
-        }
-        if vp.height >= 25 {
-            cdp_params.height = Some(vp.height.into());
-        }
-    }
+    browser
+        .config()
+        .and_then(|c| c.viewport.as_ref())
+        .and_then(|b_vp| {
+            viewport.as_ref().map(|vp| {
+                let new_viewport = b_vp.width == vp.width && b_vp.height == vp.height;
+
+                if !new_viewport {
+                    if vp.width >= 25 {
+                        cdp_params.width = Some(vp.width.into());
+                    }
+                    if vp.height >= 25 {
+                        cdp_params.height = Some(vp.height.into());
+                    }
+                    cdp_params.new_window = Some(true);
+                }
+            })
+        });
 
     let page_result = tokio::time::timeout(
         match request_timeout {
@@ -468,14 +728,9 @@ pub(crate) async fn attempt_navigation(
 /// close the browser and open handles
 pub async fn close_browser(
     browser_handle: JoinHandle<()>,
-    browser: &Browser,
-    context_id: &mut Option<BrowserContextId>,
+    _browser: &Browser,
+    _context_id: &mut Option<BrowserContextId>,
 ) {
-    if let Some(id) = context_id.take() {
-        if let Err(er) = browser.dispose_browser_context(id).await {
-            log::error!("Close Browser Error: {}", er.to_string())
-        }
-    }
     if !browser_handle.is_finished() {
         browser_handle.abort();
     }
@@ -541,292 +796,158 @@ pub async fn setup_chrome_interception_base(
 
 /// establish all the page events.
 pub async fn setup_chrome_events(chrome_page: &chromiumoxide::Page, config: &Configuration) {
-    let stealth_mode = cfg!(feature = "chrome_stealth") || config.stealth_mode;
-    let dismiss_dialogs = config.dismiss_dialogs.unwrap_or(true); // polyfill window.alert.
+    let ua = config
+        .user_agent
+        .as_deref()
+        .map(|a| a.as_str())
+        .unwrap_or("");
+
+    let mut emulation_config = spider_fingerprint::EmulationConfiguration::setup_defaults(&ua);
+
+    let stealth_mode = config.stealth_mode;
+    let stealth = stealth_mode.stealth();
+    let block_ads = config.chrome_intercept.block_ads;
+
+    emulation_config.dismiss_dialogs = config.dismiss_dialogs.unwrap_or(true);
+    emulation_config.fingerprint = config.fingerprint;
+    emulation_config.tier = stealth_mode;
+    emulation_config.user_agent_data = Some(true); // Enable this until experimental is removed from userAgentData page.setUserAgent.
+
+    let viewport = if let Some(vp) = &config.viewport {
+        Some((*vp).into())
+    } else {
+        None
+    };
+
+    let gpu_profile = spider_fingerprint::profiles::gpu::select_random_gpu_profile(
+        spider_fingerprint::get_agent_os(ua),
+    );
+
+    let merged_script = spider_fingerprint::emulate_with_profile(
+        ua,
+        &emulation_config,
+        &viewport.as_ref(),
+        &config.evaluate_on_new_document,
+        &gpu_profile,
+    );
 
     let stealth = async {
-        if stealth_mode {
-            match config.user_agent.as_ref() {
-                Some(agent) => {
-                    let _ = if dismiss_dialogs {
-                        chrome_page
-                            .enable_stealth_mode_with_agent_and_dimiss_dialogs(agent)
-                            .await
-                    } else {
-                        chrome_page.enable_stealth_mode_with_agent(agent).await
-                    };
-                }
-                _ => {
-                    let _ = chrome_page.enable_stealth_mode().await;
+        match config.user_agent.as_deref() {
+            Some(agent) if stealth => {
+                if block_ads {
+                    let _ = tokio::join!(
+                        chrome_page.add_script_to_evaluate_on_new_document(merged_script),
+                        chrome_page.set_ad_blocking_enabled(true),
+                        chrome_page.set_user_agent(agent.as_str()),
+                        chrome_page.emulate_hardware_concurrency(
+                            gpu_profile.hardware_concurrency.try_into().unwrap_or(8)
+                        ),
+                    );
+                } else {
+                    let _ = tokio::join!(
+                        chrome_page.add_script_to_evaluate_on_new_document(merged_script),
+                        chrome_page.set_user_agent(agent.as_str()),
+                    );
                 }
             }
-        }
-    };
-
-    let eval_docs = async {
-        match config.evaluate_on_new_document {
-            Some(ref script) => {
-                if config.fingerprint {
-                    let _ = chrome_page
-                        .evaluate_on_new_document(string_concat!(
-                            crate::features::chrome::FP_JS,
-                            script.as_str(),
-                            if dismiss_dialogs && !stealth_mode {
-                                DISABLE_DIALOGS
-                            } else {
-                                ""
-                            }
-                        ))
-                        .await;
+            Some(agent) => {
+                if block_ads {
+                    let _ = tokio::join!(
+                        chrome_page.set_user_agent(agent.as_str()),
+                        chrome_page.set_ad_blocking_enabled(true),
+                        chrome_page.add_script_to_evaluate_on_new_document(merged_script),
+                    );
+                } else {
+                    let _ = tokio::join!(
+                        chrome_page.set_user_agent(agent.as_str()),
+                        chrome_page.add_script_to_evaluate_on_new_document(merged_script)
+                    );
+                }
+            }
+            None if stealth => {
+                if block_ads {
+                    let _ = tokio::join!(
+                        chrome_page.add_script_to_evaluate_on_new_document(merged_script),
+                        chrome_page.set_ad_blocking_enabled(true),
+                        chrome_page.emulate_hardware_concurrency(
+                            gpu_profile.hardware_concurrency.try_into().unwrap_or(8)
+                        ),
+                    );
                 } else {
                     let _ = chrome_page
-                        .evaluate_on_new_document(string_concat!(
-                            script.as_str(),
-                            if dismiss_dialogs && !stealth_mode {
-                                DISABLE_DIALOGS
-                            } else {
-                                ""
-                            }
-                        ))
+                        .add_script_to_evaluate_on_new_document(merged_script)
                         .await;
                 }
             }
-            _ => {
-                if config.fingerprint {
-                    let _ = chrome_page
-                        .evaluate_on_new_document(string_concat!(
-                            crate::features::chrome::FP_JS,
-                            if dismiss_dialogs && !stealth_mode {
-                                DISABLE_DIALOGS
-                            } else {
-                                ""
-                            }
-                        ))
-                        .await;
-                }
-            }
+            None => (),
         }
     };
 
-    if let Err(_) = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
-        tokio::join!(stealth, eval_docs, configure_browser(&chrome_page, &config))
+    let disable_log = async {
+        if config.disable_log {
+            let _ = chrome_page.disable_log().await;
+        }
+    };
+
+    let bypass_csp = async {
+        if config.bypass_csp {
+            let _ = chrome_page.set_bypass_csp(true).await;
+        }
+    };
+
+    if let Err(_) = tokio::time::timeout(tokio::time::Duration::from_secs(15), async {
+        tokio::join!(
+            stealth,
+            disable_log,
+            bypass_csp,
+            configure_browser(&chrome_page, &config)
+        )
     })
     .await
     {
-        log::error!("failed to setup event handlers within 10 seconds.");
+        log::error!("failed to setup event handlers within 15 seconds.");
     }
 }
 
-/// static chrome arguments to start
-#[cfg(all(feature = "chrome_cpu", feature = "real_browser"))]
-pub static CHROME_ARGS: [&'static str; 27] = [
-    if cfg!(feature = "chrome_headless_new") {
-        "--headless=new"
-    } else {
-        "--headless"
-    },
-    "--disable-extensions",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-background-networking",
-    "--disable-component-update",
-    "--disable-client-side-phishing-detection",
-    "--disable-sync",
-    "--metrics-recording-only",
-    "--disable-default-apps",
-    "--mute-audio",
-    "--no-default-browser-check",
-    "--no-first-run",
-    "--disable-gpu",
-    "--disable-gpu-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-background-timer-throttling",
-    "--disable-ipc-flooding-protection",
-    "--password-store=basic",
-    "--use-mock-keychain",
-    "--force-fieldtrials=*BackgroundTracing/default/",
-    "--disable-hang-monitor",
-    "--disable-prompt-on-repost",
-    "--disable-domain-reliability",
-    "--disable-features=InterestFeedContentSuggestions,PrivacySandboxSettings4,AutofillServerCommunication,CalculateNativeWinOcclusion,OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process,ImprovedCookieControls,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,CertificateTransparencyComponentUpdater,AvoidUnnecessaryBeforeUnloadCheckSync,Translate"
-];
+pub(crate) type BrowserControl = (
+    std::sync::Arc<chromiumoxide::Browser>,
+    Option<tokio::task::JoinHandle<()>>,
+    Option<chromiumoxide::cdp::browser_protocol::browser::BrowserContextId>,
+);
 
-/// static chrome arguments to start
-#[cfg(all(not(feature = "chrome_cpu"), feature = "real_browser"))]
-pub static CHROME_ARGS: [&'static str; 24] = [
-    if cfg!(feature = "chrome_headless_new") {
-        "--headless=new"
-    } else {
-        "--headless"
-    },
-    "--disable-extensions",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-background-networking",
-    "--disable-component-update",
-    "--disable-client-side-phishing-detection",
-    "--disable-sync",
-    "--disable-dev-shm-usage",
-    "--metrics-recording-only",
-    "--disable-default-apps",
-    "--mute-audio",
-    "--no-default-browser-check",
-    "--no-first-run",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-background-timer-throttling",
-    "--disable-ipc-flooding-protection",
-    "--password-store=basic",
-    "--use-mock-keychain",
-    "--force-fieldtrials=*BackgroundTracing/default/",
-    "--disable-hang-monitor",
-    "--disable-prompt-on-repost",
-    "--disable-domain-reliability",
-    "--disable-features=InterestFeedContentSuggestions,PrivacySandboxSettings4,AutofillServerCommunication,CalculateNativeWinOcclusion,OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process,ImprovedCookieControls,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,CertificateTransparencyComponentUpdater,AvoidUnnecessaryBeforeUnloadCheckSync,Translate"
-];
+/// Once cell browser
+#[cfg(feature = "smart")]
+pub(crate) type OnceBrowser = tokio::sync::OnceCell<Option<BrowserController>>;
 
-// One of the configs below is detected by CF bots. We need to take a look at the optimal args 03/25/24.
-#[cfg(all(not(feature = "chrome_cpu"), not(feature = "real_browser")))]
-/// static chrome arguments to start application ref [https://github.com/a11ywatch/chrome/blob/main/src/main.rs#L13]
-static CHROME_ARGS: [&'static str; 60] = [
-    if cfg!(feature = "chrome_headless_new") { "--headless=new" } else { "--headless" },
-    "--no-sandbox",
-    "--no-first-run",
-    "--hide-scrollbars",
-    // "--allow-pre-commit-input",
-    // "--user-data-dir=~/.config/google-chrome",
-    "--allow-running-insecure-content",
-    "--autoplay-policy=user-gesture-required",
-    "--ignore-certificate-errors",
-    "--no-default-browser-check",
-    "--no-zygote",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage", // required or else docker containers may crash not enough memory
-    "--disable-threaded-scrolling",
-    "--disable-demo-mode",
-    "--disable-dinosaur-easter-egg",
-    "--disable-fetching-hints-at-navigation-start",
-    "--disable-site-isolation-trials",
-    "--disable-web-security",
-    "--disable-threaded-animation",
-    "--disable-sync",
-    "--disable-print-preview",
-    "--disable-partial-raster",
-    "--disable-in-process-stack-traces",
-    "--disable-v8-idle-tasks",
-    "--disable-low-res-tiling",
-    "--disable-speech-api",
-    "--disable-smooth-scrolling",
-    "--disable-default-apps",
-    "--disable-prompt-on-repost",
-    "--disable-domain-reliability",
-    "--disable-component-update",
-    "--disable-background-timer-throttling",
-    "--disable-breakpad",
-    "--disable-software-rasterizer",
-    "--disable-extensions",
-    "--disable-popup-blocking",
-    "--disable-hang-monitor",
-    "--disable-image-animation-resync",
-    "--disable-client-side-phishing-detection",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-ipc-flooding-protection",
-    "--disable-background-networking",
-    "--disable-renderer-backgrounding",
-    "--disable-field-trial-config",
-    "--disable-back-forward-cache",
-    "--disable-backgrounding-occluded-windows",
-    "--force-fieldtrials=*BackgroundTracing/default/",
-    // "--enable-automation",
-    "--log-level=3",
-    "--enable-logging=stderr",
-    "--enable-features=SharedArrayBuffer,NetworkService,NetworkServiceInProcess",
-    "--metrics-recording-only",
-    "--use-mock-keychain",
-    "--force-color-profile=srgb",
-    "--mute-audio",
-    "--no-service-autorun",
-    "--password-store=basic",
-    "--export-tagged-pdf",
-    "--no-pings",
-    "--use-gl=swiftshader",
-    "--window-size=1920,1080",
-    "--disable-features=InterestFeedContentSuggestions,PrivacySandboxSettings4,AutofillServerCommunication,CalculateNativeWinOcclusion,OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process,ImprovedCookieControls,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,CertificateTransparencyComponentUpdater,AvoidUnnecessaryBeforeUnloadCheckSync,Translate"
-];
+/// Create the browser controller to auto drop connections.
+pub struct BrowserController {
+    /// The browser.
+    pub browser: BrowserControl,
+    /// Closed browser.
+    pub closed: bool,
+}
 
-#[cfg(all(feature = "chrome_cpu", not(feature = "real_browser")))]
-/// static chrome arguments to start application ref [https://github.com/a11ywatch/chrome/blob/main/src/main.rs#L13]
-static CHROME_ARGS: [&'static str; 63] = [
-    if cfg!(feature = "chrome_headless_new") { "--headless=new" } else { "--headless" },
-    "--no-sandbox",
-    "--no-first-run",
-    "--hide-scrollbars",
-    // "--allow-pre-commit-input",
-    // "--user-data-dir=~/.config/google-chrome",
-    "--allow-running-insecure-content",
-    "--autoplay-policy=user-gesture-required",
-    "--ignore-certificate-errors",
-    "--no-default-browser-check",
-    "--no-zygote",
-    "--in-process-gpu",
-    "--disable-gpu",
-    "--disable-gpu-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage", // required or else docker containers may crash not enough memory
-    "--disable-threaded-scrolling",
-    "--disable-demo-mode",
-    "--disable-dinosaur-easter-egg",
-    "--disable-fetching-hints-at-navigation-start",
-    "--disable-site-isolation-trials",
-    "--disable-web-security",
-    "--disable-threaded-animation",
-    "--disable-sync",
-    "--disable-print-preview",
-    "--disable-partial-raster",
-    "--disable-in-process-stack-traces",
-    "--disable-v8-idle-tasks",
-    "--disable-low-res-tiling",
-    "--disable-speech-api",
-    "--disable-smooth-scrolling",
-    "--disable-default-apps",
-    "--disable-prompt-on-repost",
-    "--disable-domain-reliability",
-    "--disable-component-update",
-    "--disable-background-timer-throttling",
-    "--disable-breakpad",
-    "--disable-software-rasterizer",
-    "--disable-extensions",
-    "--disable-popup-blocking",
-    "--disable-hang-monitor",
-    "--disable-image-animation-resync",
-    "--disable-client-side-phishing-detection",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-ipc-flooding-protection",
-    "--disable-background-networking",
-    "--disable-renderer-backgrounding",
-    "--disable-field-trial-config",
-    "--disable-back-forward-cache",
-    "--disable-backgrounding-occluded-windows",
-    "--force-fieldtrials=*BackgroundTracing/default/",
-    // "--enable-automation",
-    "--log-level=3",
-    "--enable-logging=stderr",
-    "--enable-features=SharedArrayBuffer,NetworkService,NetworkServiceInProcess",
-    "--metrics-recording-only",
-    "--use-mock-keychain",
-    "--force-color-profile=srgb",
-    "--mute-audio",
-    "--no-service-autorun",
-    "--password-store=basic",
-    "--export-tagged-pdf",
-    "--no-pings",
-    "--use-gl=swiftshader",
-    "--window-size=1920,1080",
-    "--disable-features=InterestFeedContentSuggestions,PrivacySandboxSettings4,AutofillServerCommunication,CalculateNativeWinOcclusion,OptimizationHints,AudioServiceOutOfProcess,IsolateOrigins,site-per-process,ImprovedCookieControls,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,CertificateTransparencyComponentUpdater,AvoidUnnecessaryBeforeUnloadCheckSync,Translate"
-];
+impl BrowserController {
+    /// A new browser controller.
+    pub(crate) fn new(browser: BrowserControl) -> Self {
+        BrowserController {
+            browser,
+            closed: false,
+        }
+    }
+    /// Dispose the browser context and join handler.
+    pub fn dispose(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            if let Some(handler) = self.browser.1.take() {
+                handler.abort();
+            }
+        }
+    }
+}
 
-/// Fingerprint handling
-pub(crate) static FP_JS: &'static str = r#"const toBlob=HTMLCanvasElement.prototype.toBlob,toDataURL=HTMLCanvasElement.prototype.toDataURL,getImageData=CanvasRenderingContext2D.prototype.getImageData,noisify=function(e,t){let o={r:Math.floor(10*Math.random())-5,g:Math.floor(10*Math.random())-5,b:Math.floor(10*Math.random())-5,a:Math.floor(10*Math.random())-5},r=e.width,n=e.height,a=getImageData.apply(t,[0,0,r,n]);for(let i=0;i<n;i++)for(let f=0;f<r;f++){let l=i*(4*r)+4*f;a.data[l+0]=a.data[l+0]+o.r,a.data[l+1]=a.data[l+1]+o.g,a.data[l+2]=a.data[l+2]+o.b,a.data[l+3]=a.data[l+3]+o.a}t.putImageData(a,0,0)};Object.defineProperty(HTMLCanvasElement.prototype,"toBlob",{value:function(){return noisify(this,this.getContext("2d")),toBlob.apply(this,arguments)}}),Object.defineProperty(HTMLCanvasElement.prototype,"toDataURL",{value:function(){return noisify(this,this.getContext("2d")),toDataURL.apply(this,arguments)}}),Object.defineProperty(CanvasRenderingContext2D.prototype,"getImageData",{value:function(){return noisify(this.canvas,this),getImageData.apply(this,arguments)}});const config={random:{value:function(){return Math.random()},item:function(e){let t=e.length*config.random.value();return e[Math.floor(t)]},array:function(e){let t=config.random.item(e);return new Int32Array([t,t])},items:function(e,t){let o=e.length,r=Array(t),n=Array(o);for(t>o&&(t=o);t--;){let a=Math.floor(config.random.value()*o);r[t]=e[a in n?n[a]:a],n[a]=--o in n?n[o]:o}return r}},spoof:{webgl:{buffer:function(e){let t=e.prototype.bufferData;Object.defineProperty(e.prototype,"bufferData",{value:function(){let e=Math.floor(10*config.random.value()),o=.1*config.random.value()*arguments[1][e];return arguments[1][e]=arguments[1][e]+o,t.apply(this,arguments)}})},parameter:function(e){e.prototype.getParameter,Object.defineProperty(e.prototype,"getParameter",{value:function(){let e=new Float32Array([1,8192]);if(3415===arguments[0])return 0;if(3414===arguments[0])return 24;if(35661===arguments[0])return config.random.items([128,192,256]);if(3386===arguments[0])return config.random.array([8192,16384,32768]);if(36349===arguments[0]||36347===arguments[0])return config.random.item([4096,8192]);else if(34047===arguments[0]||34921===arguments[0])return config.random.items([2,4,8,16]);else if(7937===arguments[0]||33901===arguments[0]||33902===arguments[0])return e;else if(34930===arguments[0]||36348===arguments[0]||35660===arguments[0])return config.random.item([16,32,64]);else if(34076===arguments[0]||34024===arguments[0]||3379===arguments[0])return config.random.item([16384,32768]);else if(3413===arguments[0]||3412===arguments[0]||3411===arguments[0]||3410===arguments[0]||34852===arguments[0])return config.random.item([2,4,8,16]);else return config.random.item([0,2,4,8,16,32,64,128,256,512,1024,2048,4096,])}})}}}};config.spoof.webgl.buffer(WebGLRenderingContext),config.spoof.webgl.buffer(WebGL2RenderingContext),config.spoof.webgl.parameter(WebGLRenderingContext),config.spoof.webgl.parameter(WebGL2RenderingContext);const rand={noise:function(){return Math.floor(Math.random()+(Math.random()<Math.random()?-1:1)*Math.random())},sign:function(){let e=[-1,-1,-1,-1,-1,-1,1,-1,-1,-1],t=Math.floor(Math.random()*e.length);return e[t]}};Object.defineProperty(HTMLElement.prototype,"offsetHeight",{get(){let e=Math.floor(this.getBoundingClientRect().height),t=e&&1===rand.sign(),o=t?e+rand.noise():e;return o}}),Object.defineProperty(HTMLElement.prototype,"offsetWidth",{get(){let e=Math.floor(this.getBoundingClientRect().width),t=e&&1===rand.sign(),o=t?e+rand.noise():e;return o}});const context={BUFFER:null,getChannelData:function(e){let t=e.prototype.getChannelData;Object.defineProperty(e.prototype,"getChannelData",{value:function(){let e=t.apply(this,arguments);if(context.BUFFER!==e){context.BUFFER=e;for(let o=0;o<e.length;o+=100){let r=Math.floor(Math.random()*o);e[r]=e[r]+1e-7*Math.random()}}return e}})},createAnalyser:function(e){let t=e.prototype.__proto__.createAnalyser;Object.defineProperty(e.prototype.__proto__,"createAnalyser",{value:function(){let e=t.apply(this,arguments),o=e.__proto__.getFloatFrequencyData;return Object.defineProperty(e.__proto__,"getFloatFrequencyData",{value:function(){let e=o.apply(this,arguments);for(let t=0;t<arguments[0].length;t+=100){let r=Math.floor(Math.random()*t);arguments[0][r]=arguments[0][r]+.1*Math.random()}return e}}),e}})}};context.getChannelData(AudioBuffer),context.createAnalyser(AudioContext),context.getChannelData(OfflineAudioContext),context.createAnalyser(OfflineAudioContext),navigator.mediaDevices.getUserMedia=navigator.webkitGetUserMedia=navigator.mozGetUserMedia=navigator.getUserMedia=webkitRTCPeerConnection=RTCPeerConnection=MediaStreamTrack=void 0;const getParameter=WebGLRenderingContext.prototype.getParameter;WebGLRenderingContext.prototype.getParameter=function(e){return 37445===e?"Intel Open Source Technology Center":37446===e?"Mesa DRI Intel(R) Ivybridge Mobile ":getParameter.call(this,e)};const newProto=navigator.__proto__;delete newProto.webdriver,navigator.__proto__=newProto;"#;
-// /// Handle extracting links from anchors that are not found.
-// pub(crate) static ANCHOR_EVENTS: &'static str = r###"() => new Promise((resolve) => { const _pageRoutes = new Set(), _originalPushState = window.history.pushState; window.history.pushState = function(_state, _title, _url) { _pageRoutes.add(_url) }; function _onRouteChange() { _pageRoutes.add(window.location.href) } document.querySelectorAll("a:not([href])").forEach(_anchor => { _anchor.click() }); window.addEventListener("popstate", _onRouteChange); return resolve(Array.from(_pageRoutes)); } )"###;
+impl Drop for BrowserController {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}

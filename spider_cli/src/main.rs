@@ -1,3 +1,13 @@
+// performance reasons jemalloc memory backend for dedicated work and large crawls
+#[cfg(all(
+    not(windows),
+    not(target_os = "android"),
+    not(target_env = "musl"),
+    feature = "jemalloc"
+))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 extern crate env_logger;
 extern crate serde_json;
 extern crate spider;
@@ -7,16 +17,79 @@ pub mod options;
 use crate::spider::tokio::io::AsyncWriteExt;
 use clap::Parser;
 use options::{Cli, Commands};
-use serde_json::json;
+
+use serde_json::{json, Value};
+
+use spider::client::header::{HeaderMap, HeaderValue};
 use spider::features::chrome_common::RequestInterceptConfiguration;
 use spider::hashbrown::HashMap;
-use spider::page::get_page_selectors;
-use spider::string_concat::string_concat;
-use spider::string_concat::string_concat_impl;
+use spider::page::Page;
+use spider::string_concat::{string_concat, string_concat_impl};
 use spider::tokio;
+use spider::utils::header_utils::header_map_to_hash_map;
 use spider::utils::log;
 use spider::website::Website;
 use std::path::{Path, PathBuf};
+
+/// convert the headers to json
+fn headers_to_json(headers: &Option<HeaderMap<HeaderValue>>) -> Value {
+    if let Some(headers) = &headers {
+        serde_json::to_value(&header_map_to_hash_map(headers)).unwrap_or_default()
+    } else {
+        Value::Null
+    }
+}
+
+/// handle the headers
+#[cfg(feature = "headers")]
+fn handle_headers(res: &Page) -> Value {
+    headers_to_json(&res.headers)
+}
+
+/// handle the headers
+#[cfg(not(feature = "headers"))]
+fn handle_headers(_res: &Page) -> Value {
+    headers_to_json(&None)
+}
+
+/// handle the duration elaspsed to milliseconds.
+#[cfg(feature = "time")]
+fn handle_time(res: &Page, mut json: Value) -> Value {
+    json["duration_elapsed_ms"] = json!(res.get_duration_elapsed().as_millis());
+    json
+}
+
+/// handle the duration elaspsed to milliseconds.
+#[cfg(not(feature = "time"))]
+fn handle_time(_res: &Page, mut _json: Value) -> Value {
+    _json
+}
+
+/// handle the HTTP status code.
+#[cfg(feature = "status_code")]
+fn handle_status_code(res: &Page, mut json: Value) -> Value {
+    json["status_code"] = res.status_code.as_u16().into();
+    json
+}
+
+/// handle the HTTP status code.
+#[cfg(not(feature = "status_code"))]
+fn handle_status_code(_res: &Page, mut _json: Value) -> Value {
+    _json
+}
+
+/// handle the remote address.
+#[cfg(feature = "remote_addr")]
+fn handle_remote_address(res: &Page, mut json: Value) -> Value {
+    json["remote_address"] = json!(res.remote_addr);
+    json
+}
+
+/// handle the remote address.
+#[cfg(not(feature = "remote_addr"))]
+fn handle_remote_address(_res: &Page, mut _json: Value) -> Value {
+    _json
+}
 
 #[tokio::main]
 async fn main() {
@@ -44,6 +117,7 @@ async fn main() {
         .with_subdomains(cli.subdomains)
         .with_chrome_intercept(RequestInterceptConfiguration::new(cli.block_images))
         .with_danger_accept_invalid_certs(cli.accept_invalid_certs)
+        .with_full_resources(cli.full_resources)
         .with_tld(cli.tld)
         .with_blacklist_url(
             cli.blacklist_url
@@ -74,6 +148,8 @@ async fn main() {
         website.with_external_domains(Some(domains.into_iter()));
     }
 
+    let return_headers = cli.return_headers;
+
     match website
         .build()
     {
@@ -98,7 +174,15 @@ async fn main() {
 
                     if output_links {
                         while let Ok(res) = rx2.recv().await {
-                            let _ = stdout.write_all(string_concat!(res.get_url(), "\n").as_bytes()).await;
+                            if return_headers {
+                                let headers_json = handle_headers(&res);
+
+                                let _ = stdout
+                                    .write_all(format!("{} - {}\n", res.get_url(), headers_json).as_bytes())
+                                    .await;
+                            } else {
+                                let _ = stdout.write_all(string_concat!(res.get_url(), "\n").as_bytes()).await;
+                            }
                         }
                     }
                 }
@@ -120,7 +204,7 @@ async fn main() {
                     });
 
                     while let Ok(res) = rx2.recv().await {
-                        if let Some(parsed_url) = res.get_url_parsed() {
+                        if let Some(parsed_url) = res.get_url_parsed_ref() {
                             log("Storing", parsed_url);
                                 let url_path = parsed_url.path();
 
@@ -169,17 +253,15 @@ async fn main() {
                 }) => {
                     let mut stdout = tokio::io::stdout();
 
-                    let selectors: Option<spider::RelativeSelectors> = if output_links {
-                        get_page_selectors(&url, cli.subdomains, cli.tld)
-                    } else {
-                        None
-                    };
+                    if output_links {
+                        website.configuration.return_page_links = true;
+                    }
 
                     tokio::spawn(async move {
                         website.crawl().await;
                     });
 
-                    while let Ok(mut res) = rx2.recv().await {
+                    while let Ok(res) = rx2.recv().await {
                         let page_json = json!({
                             "url": res.get_url(),
                             "html": if output_html {
@@ -187,11 +269,20 @@ async fn main() {
                             } else {
                                 Default::default()
                             },
-                            "links": match selectors {
-                                Some(ref s) => res.links(s).await.iter().map(|i| i.inner().to_string()).collect::<serde_json::Value>(),
+                            "links": match res.page_links {
+                                Some(ref s) => s.iter().map(|i| i.inner().to_string()).collect::<serde_json::Value>(),
                                 _ => Default::default()
+                            },
+                            "headers": if return_headers {
+                               handle_headers(&res)
+                            } else {
+                                Default::default()
                             }
                         });
+
+                        let page_json = handle_time(&res, page_json);
+                        let page_json = handle_status_code(&res, page_json);
+                        let page_json = handle_remote_address(&res, page_json);
 
                         match serde_json::to_string_pretty(&page_json) {
                             Ok(j) => {

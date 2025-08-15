@@ -1,9 +1,7 @@
 [package]
 name = "spider_examples"
-version = "2.8.6"
-authors = [
-    "j-mendez <jeff@spider.cloud>",
-]
+version = "2.37.104"
+authors = ["j-mendez <jeff@spider.cloud>"]
 description = "Multithreaded web crawler written in Rust."
 repository = "https://github.com/spider-rs/spider"
 readme = "README.md"
@@ -12,7 +10,7 @@ categories = ["web-programming"]
 license = "MIT"
 documentation = "https://docs.rs/spider"
 publish = false
-edition = "2018"
+edition = "2021"
 
 [badges]
 maintenance = { status = "as-is" }
@@ -31,7 +29,9 @@ features = ["serde"]
 
 [dependencies.spider_utils]
 version = "2"
-path = "../spider_utils"
+
+[dependencies.spider_transformations]
+version = "2"
 
 [[example]]
 name = "example"
@@ -63,6 +63,11 @@ path = "subscribe.rs"
 required-features = ["spider/sync"]
 
 [[example]]
+name = "subscribe_multiple"
+path = "subscribe_multiple.rs"
+required-features = ["spider/sync"]
+
+[[example]]
 name = "loop"
 path = "loop.rs"
 required-features = ["spider/sync", "spider/smart"]
@@ -75,7 +80,11 @@ required-features = ["spider/sync", "spider/cache"]
 [[example]]
 name = "cache_chrome_hybrid"
 path = "cache_chrome_hybrid.rs"
-required-features = ["spider/sync", "spider/chrome", "spider/cache_chrome_hybrid"]
+required-features = [
+    "spider/sync",
+    "spider/chrome",
+    "spider/cache_chrome_hybrid",
+]
 
 [[example]]
 name = "rss"
@@ -89,6 +98,11 @@ path = "callback.rs"
 [[example]]
 name = "sitemap"
 path = "sitemap.rs"
+required-features = ["spider/sitemap"]
+
+[[example]]
+name = "sitemap_only"
+path = "sitemap_only.rs"
 required-features = ["spider/sitemap"]
 
 [[example]]
@@ -129,9 +143,31 @@ path = "chrome_remote.rs"
 required-features = ["spider/sync", "spider/chrome"]
 
 [[example]]
+name = "anti_bots"
+path = "anti_bots.rs"
+required-features = ["spider/sync", "spider/chrome"]
+
+[[example]]
+name = "chrome_remote_tls"
+path = "chrome_remote_tls.rs"
+required-features = [
+    "spider/sync",
+    "spider/chrome",
+    "spider/chrome_tls_connection",
+]
+
+[[example]]
+name = "chrome_sendable"
+path = "chrome_sendable.rs"
+required-features = ["spider/sync", "spider/chrome"]
+
+[[example]]
 name = "real_world"
 path = "real_world.rs"
-required-features = ["spider/sync", "spider/chrome", "spider_utils/transformations"]
+required-features = [
+    "spider/sync",
+    "spider/chrome"
+]
 
 [[example]]
 name = "chrome_viewport"
@@ -217,8 +253,3 @@ required-features = ["spider/sync"]
 name = "css_scrape"
 path = "css_scrape.rs"
 required-features = ["spider/sync"]
-
-[[example]]
-name = "transform_markdown"
-path = "transform_markdown.rs"
-required-features = ["spider/sync", "spider_utils/transformations"]

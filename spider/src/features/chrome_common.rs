@@ -1,7 +1,7 @@
 use crate::utils::trie::Trie;
 
 #[cfg(feature = "chrome")]
-use chromiumoxide::handler::blockers::intercept_manager::NetworkInterceptManager;
+use chromiumoxide::handler::blockers::NetworkInterceptManager;
 
 /// wrapper for non chrome interception. does nothing.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -150,7 +150,7 @@ impl From<CaptureScreenshotFormat>
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// View port handling for chrome.
 pub struct Viewport {
@@ -210,6 +210,19 @@ impl Viewport {
 
 #[cfg(feature = "chrome")]
 impl From<Viewport> for chromiumoxide::handler::viewport::Viewport {
+    fn from(viewport: Viewport) -> Self {
+        Self {
+            width: viewport.width,
+            height: viewport.height,
+            device_scale_factor: viewport.device_scale_factor,
+            emulating_mobile: viewport.emulating_mobile,
+            is_landscape: viewport.is_landscape,
+            has_touch: viewport.has_touch,
+        }
+    }
+}
+
+impl From<Viewport> for spider_fingerprint::spoof_viewport::Viewport {
     fn from(viewport: Viewport) -> Self {
         Self {
             width: viewport.width,
@@ -339,10 +352,7 @@ impl From<ScreenshotParams> for chromiumoxide::page::ScreenshotParams {
                 _ => false,
             }
         } else {
-            match std::env::var("SCREENSHOT_FULL_PAGE") {
-                Ok(t) => t == "true",
-                _ => true,
-            }
+            std::env::var("SCREENSHOT_FULL_PAGE").unwrap_or_default() == "true"
         };
         let omit_background = if params.omit_background.is_some() {
             match params.omit_background {
@@ -461,6 +471,10 @@ pub enum WebAutomation {
     Evaluate(String),
     /// Clicks on an element.
     Click(String),
+    /// Clicks on all elements.
+    ClickAll(String),
+    /// Clicks on all elements.
+    ClickAllClickable(),
     /// Waits for a fixed duration in milliseconds.
     Wait(u64),
     /// Waits for the next navigation event.
@@ -469,11 +483,18 @@ pub enum WebAutomation {
     WaitForDom {
         /// The selector of the element to wait for updates.
         selector: Option<String>,
-        ///  The timeout to wait for.
+        ///  The timeout to wait for in ms.
         timeout: u32,
     },
     /// Waits for an element to appear.
     WaitFor(String),
+    /// Waits for an element to appear with a timeout.
+    WaitForWithTimeout {
+        /// The selector of the element to wait for updates.
+        selector: String,
+        ///  The timeout to wait for in ms.
+        timeout: u64,
+    },
     /// Waits for an element to appear and then clicks on it.
     WaitForAndClick(String),
     /// Scrolls the screen in the horizontal axis by a specified amount in pixels.
@@ -498,6 +519,74 @@ pub enum WebAutomation {
         /// The output file to store the screenshot.
         output: String,
     },
+    /// Only continue to the next automation if the prior step was valid. Use this intermediate after a step to break out of the chain.
+    ValidateChain,
+}
+
+impl WebAutomation {
+    /// Machine-friendly variant name (no params).
+    pub fn name(&self) -> &'static str {
+        use WebAutomation::*;
+        match self {
+            Evaluate(_) => "Evaluate",
+            Click(_) => "Click",
+            ClickAll(_) => "ClickAll",
+            ClickAllClickable() => "ClickAllClickable",
+            Wait(_) => "Wait",
+            WaitForNavigation => "WaitForNavigation",
+            WaitForDom { .. } => "WaitForDom",
+            WaitFor(_) => "WaitFor",
+            WaitForWithTimeout { .. } => "WaitForWithTimeout",
+            WaitForAndClick(_) => "WaitForAndClick",
+            ScrollX(_) => "ScrollX",
+            ScrollY(_) => "ScrollY",
+            Fill { .. } => "Fill",
+            InfiniteScroll(_) => "InfiniteScroll",
+            Screenshot { .. } => "Screenshot",
+            ValidateChain => "ValidateChain",
+        }
+    }
+
+    /// Optional: human-friendly label with key params.
+    pub fn label(&self) -> String {
+        use WebAutomation::*;
+        match self {
+            Evaluate(_) => "Evaluate JS".into(),
+            Click(s) => format!("Click {}", s),
+            ClickAll(s) => format!("ClickAll {}", s),
+            ClickAllClickable() => "ClickAllClickable".into(),
+            Wait(ms) => format!("Wait {}ms", ms),
+            WaitForNavigation => "WaitForNavigation".into(),
+            WaitForDom { selector, timeout } => selector
+                .as_ref()
+                .map(|s| format!("WaitForDom {} ({}ms)", s, timeout))
+                .unwrap_or_else(|| format!("WaitForDom ({}ms)", timeout)),
+            WaitFor(s) => format!("WaitFor {}", s),
+            WaitForWithTimeout { selector, timeout } => {
+                format!("WaitForWithTimeout {} ({}ms)", selector, timeout)
+            }
+            WaitForAndClick(s) => format!("WaitForAndClick {}", s),
+            ScrollX(dx) => format!("ScrollX {}", dx),
+            ScrollY(dy) => format!("ScrollY {}", dy),
+            Fill { selector, .. } => format!("Fill {}", selector),
+            InfiniteScroll(n) => format!("InfiniteScroll {}", n),
+            Screenshot {
+                full_page,
+                omit_background,
+                output,
+            } => format!(
+                "Screenshot full={} omit_bg={} -> {}",
+                full_page, omit_background, output
+            ),
+            ValidateChain => "ValidateChain".into(),
+        }
+    }
+}
+
+impl core::fmt::Display for WebAutomation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.label())
+    }
 }
 
 #[cfg(feature = "chrome")]
@@ -506,18 +595,12 @@ pub(crate) fn generate_wait_for_dom_js_code_with_selector(
     timeout: u32,
     selector: Option<&str>,
 ) -> String {
-    let clamped_timeout = if timeout > 60000 { 60000 } else { timeout };
-    let query_selector = selector.unwrap_or("body");
-
+    let t = timeout.min(crate::utils::FIVE_MINUTES);
+    let s = selector.unwrap_or("body");
     format!(
-        "new Promise((r,j)=>{{ \
-            let t={}; \
-            let i=setTimeout(()=>{{j(new Error('Timeout: DOM did not update within the allowed time.'))}},t); \
-            if(document.querySelector('{}')){{clearTimeout(i);r();}}else{{ \
-            const o=new MutationObserver((m,a)=>{{ \
-                if(document.querySelector('{}')){{a.disconnect();clearTimeout(i);r();}}}}); \
-            o.observe(document,{{childList:true,subtree:true}});}}}});",
-        clamped_timeout, query_selector, query_selector
+        "new Promise((r,j)=>{{const s='{s}',t={t},i=220,n=50;let l=Date.now(),el,o,d,c;const check=()=>{{el=document.querySelector(s);if(!el)return;clearInterval(wait);l=Date.now();o=new MutationObserver(()=>{{l=Date.now();}});o.observe(el,{{childList:!0,subtree:!0,attributes:!0,characterData:!0}});d=setTimeout(()=>{{clearInterval(c),o.disconnect(),j(new Error('Dom Timeout.'))}},t);c=setInterval(()=>{{Date.now()-l>=i&&(clearTimeout(d),clearInterval(c),o.disconnect(),r(!0))}},n);}};const wait=setInterval(check,n);check();}});",
+        s = s,
+        t = t
     )
 }
 
@@ -537,74 +620,109 @@ pub(crate) fn generate_wait_for_dom_js_code_with_selector_base(
     )
 }
 
+#[cfg(feature = "chrome")]
+const CLICKABLE_SELECTOR: &str = concat!(
+    "a[href],",
+    "button:not([disabled]),",
+    "input[type='button']:not([disabled]),",
+    "input[type='submit']:not([disabled]),",
+    "input[type='reset']:not([disabled]),",
+    "input[type='checkbox']:not([disabled]),",
+    "input[type='radio']:not([disabled]),",
+    "label[for],",
+    "summary,",
+    "select:not([disabled]),",
+    "textarea:not([disabled]),",
+    "[role='button']:not([aria-disabled='true']),",
+    "[role='link']:not([aria-disabled='true']),",
+    "[onclick],",
+    "[contenteditable=''],[contenteditable='true'],",
+    // focusables as a last resort
+    "[tabindex]:not([tabindex^='-'])"
+);
+
 impl WebAutomation {
     #[cfg(feature = "chrome")]
     /// Run the web automation step.
-    pub async fn run(&self, page: &chromiumoxide::Page) {
+    pub async fn run(&self, page: &chromiumoxide::Page) -> bool {
         use crate::utils::wait_for_selector;
-        use chromiumoxide::cdp::browser_protocol::dom::Rect;
-        use chromiumoxide::cdp::browser_protocol::dom::ScrollIntoViewIfNeededParams;
         use std::time::Duration;
+
+        let mut valid = false;
 
         match self {
             WebAutomation::Evaluate(js) => {
-                let _ = page.evaluate(js.as_str()).await;
+                valid = page.evaluate(js.as_str()).await.is_ok();
             }
-            WebAutomation::Click(selector) => match page.find_element(selector).await {
-                Ok(ele) => {
-                    let _ = ele.click().await;
+            WebAutomation::Click(selector) => {
+                if let Ok(ele) = page.find_element(selector).await {
+                    valid = ele.click().await.is_ok();
                 }
-                _ => (),
-            },
+            }
+            WebAutomation::WaitForWithTimeout { selector, timeout } => {
+                valid =
+                    wait_for_selector(page, Some(Duration::from_millis(*timeout)), &selector).await;
+            }
             WebAutomation::Wait(ms) => {
-                tokio::time::sleep(Duration::from_millis(*ms).min(Duration::from_secs(60))).await;
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+                valid = true;
+            }
+            WebAutomation::ClickAll(selector) => {
+                if let Ok(eles) = page.find_elements(selector).await {
+                    for ele in eles {
+                        valid = ele.click().await.is_ok();
+                    }
+                }
+            }
+            WebAutomation::ClickAllClickable() => {
+                if let Ok(eles) = page.find_elements(CLICKABLE_SELECTOR).await {
+                    for ele in eles {
+                        valid = ele.click().await.is_ok();
+                    }
+                }
             }
             WebAutomation::WaitForDom { selector, timeout } => {
-                let _ = page
+                valid = page
                     .evaluate(
                         generate_wait_for_dom_js_code_with_selector(*timeout, selector.as_deref())
                             .as_str(),
                     )
-                    .await;
+                    .await
+                    .is_ok();
             }
             WebAutomation::WaitFor(selector) => {
-                wait_for_selector(page, Some(Duration::from_secs(60)), &selector).await;
+                valid = wait_for_selector(page, Some(Duration::from_secs(60)), &selector).await;
             }
             WebAutomation::WaitForNavigation => {
-                let _ = page.wait_for_navigation().await;
+                valid = page.wait_for_navigation().await.is_ok();
             }
             WebAutomation::WaitForAndClick(selector) => {
-                wait_for_selector(page, Some(Duration::from_secs(60)), &selector).await;
-                match page.find_element(selector).await {
-                    Ok(ele) => {
-                        let _ = ele.click().await;
-                    }
-                    _ => (),
+                valid = wait_for_selector(page, Some(Duration::from_secs(60)), &selector).await;
+                if let Ok(ele) = page.find_element(selector).await {
+                    valid = ele.click().await.is_ok();
                 }
             }
             WebAutomation::ScrollX(px) => {
-                let mut cmd = ScrollIntoViewIfNeededParams::builder().build();
-                let rect = Rect::new(*px, 0.0, 10.0, 10.0);
-                cmd.rect = Some(rect);
-                let _ = page.execute(cmd);
+                valid = page
+                    .scroll_by((*px as f32).into(), 0.0, Default::default())
+                    .await
+                    .is_ok()
             }
             WebAutomation::ScrollY(px) => {
-                let mut cmd = ScrollIntoViewIfNeededParams::builder().build();
-                let rect = Rect::new(0.0, *px, 10.0, 10.0);
-                cmd.rect = Some(rect);
-                let _ = page.execute(cmd);
+                valid = page
+                    .scroll_by(0.0, (*px as f32).into(), Default::default())
+                    .await
+                    .is_ok()
             }
-            WebAutomation::Fill { selector, value } => match page.find_element(selector).await {
-                Ok(ele) => match ele.click().await {
-                    Ok(el) => {
-                        let _ = el.type_str(value).await;
+            WebAutomation::Fill { selector, value } => {
+                if let Ok(ele) = page.find_element(selector).await {
+                    if let Ok(el) = ele.click().await {
+                        valid = el.type_str(value).await.is_ok();
                     }
-                    _ => (),
-                },
-                _ => (),
-            },
+                }
+            }
             WebAutomation::InfiniteScroll(duration) => {
-                let _ = page.evaluate(set_dynamic_scroll(*duration)).await;
+                valid = page.evaluate(set_dynamic_scroll(*duration)).await.is_ok();
             }
             WebAutomation::Screenshot {
                 full_page,
@@ -617,15 +735,21 @@ impl WebAutomation {
                 let screenshot_params =
                     ScreenshotParams::new(cdp_params, Some(*full_page), Some(*omit_background));
 
-                let _ = page.save_screenshot(screenshot_params, output).await;
+                valid = page
+                    .save_screenshot(screenshot_params, output)
+                    .await
+                    .is_ok();
             }
-        }
+            _ => (),
+        };
+
+        valid
     }
 }
 
 /// Set a dynamic time to scroll.
 pub fn set_dynamic_scroll(timeout: u32) -> String {
-    let timeout = timeout.min(60000);
+    let timeout = timeout.min(crate::utils::FIVE_MINUTES);
     let s = string_concat!(
         r###"document.addEventListener('DOMContentLoaded',e=>{let t=null,o=null,n="###,
         timeout.to_string(),
@@ -674,6 +798,7 @@ impl RequestInterceptConfiguration {
             block_visuals: true,
             block_analytics: true,
             block_stylesheets: true,
+            block_ads: true,
             ..Default::default()
         }
     }
@@ -748,20 +873,14 @@ pub async fn eval_execution_scripts(
     target_url: &str,
     execution_scripts: &Option<ExecutionScripts>,
 ) {
-    match execution_scripts {
-        Some(ref scripts) => {
-            if let Some(script) = scripts.search(target_url) {
+    if let Some(scripts) = &execution_scripts {
+        if let Some(script) = scripts.search(target_url) {
+            let _ = page.evaluate(script.as_str()).await;
+        } else if scripts.match_all {
+            if let Some(script) = scripts.root.value.as_ref() {
                 let _ = page.evaluate(script.as_str()).await;
-            } else if scripts.match_all {
-                match scripts.root.value.as_ref() {
-                    Some(script) => {
-                        let _ = page.evaluate(script.as_str()).await;
-                    }
-                    _ => (),
-                }
             }
         }
-        _ => (),
     }
 }
 
@@ -774,30 +893,161 @@ pub async fn eval_automation_scripts(
 ) {
     if let Some(script_map) = automation_scripts {
         if let Some(scripts) = script_map.search(target_url) {
+            let mut valid = false;
+
             for script in scripts {
-                if let Err(elasped) =
-                    tokio::time::timeout(tokio::time::Duration::from_secs(60), script.run(page))
-                        .await
+                if script == &WebAutomation::ValidateChain && !valid {
+                    break;
+                }
+                match tokio::time::timeout(tokio::time::Duration::from_secs(60), script.run(page))
+                    .await
                 {
-                    log::warn!("Script execution timed out for: {target_url} - {elasped}",);
+                    Ok(next) => valid = next,
+                    Err(elasped) => {
+                        log::warn!("Script execution timed out for: {target_url} - {elasped}")
+                    }
                 }
             }
         } else if script_map.match_all {
-            match script_map.root.value.as_ref() {
-                Some(scripts) => {
-                    for script in scripts {
-                        if let Err(elasped) = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(60),
-                            script.run(page),
-                        )
-                        .await
-                        {
-                            log::warn!("Script execution timed out for: {target_url} - {elasped}",);
+            if let Some(scripts) = script_map.root.value.as_ref() {
+                let mut valid = false;
+
+                for script in scripts {
+                    if script == &WebAutomation::ValidateChain && !valid {
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(60),
+                        script.run(page),
+                    )
+                    .await
+                    {
+                        Ok(next) => valid = next,
+                        Err(elasped) => {
+                            log::warn!("Script execution timed out for: {target_url} - {elasped}")
                         }
                     }
                 }
-                _ => (),
             }
+        }
+    }
+}
+
+/// Installs a MutationObserver + URL change hooks and a drain function.
+#[cfg(feature = "chrome")]
+const INSTALL_OBSERVER_JS: &str = r##"(function(){const Q=[],cap=100,cssPath=e=>{if(!e||1!==e.nodeType)return"#text";const t=[];for(;e&&1===e.nodeType&&e!==document.documentElement;){let n=e.nodeName.toLowerCase();if(e.id){n+="#"+e.id,t.unshift(n);break}else{let d=e,l=1;for(;(d=d.previousElementSibling)!=null;)if(d.nodeName===e.nodeName)l++;n+=":nth-of-type("+l+")"}t.unshift(n),e=e.parentElement}return t.length?t.join(">"):"html"},serialize=e=>"childList"===e.type?{type:"childList",target:cssPath(e.target),added:Array.from(e.addedNodes||[]).slice(0,3).map(t=>1===t.nodeType?t.outerHTML:"#text"),removed:Array.from(e.removedNodes||[]).slice(0,3).map(t=>1===t.nodeType?t.outerHTML:"#text")}:"attributes"===e.type?{type:"attributes",target:cssPath(e.target),attribute:e.attributeName||"",old:e.oldValue||null}:{type:e.type,target:cssPath(e.target)},pushEntry=e=>{const t={t:Date.now(),url:location.href,mutations:e?e.map(serialize):[]};Q.push(t),Q.length>cap&&Q.splice(0,Q.length-cap)};new MutationObserver(e=>pushEntry(Array.from(e))).observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,characterData:!1,attributeOldValue:!0});const notify=()=>pushEntry(null);["pushState","replaceState"].forEach(e=>{const t=history[e];history[e]=function(){const e=t.apply(this,arguments);return window.dispatchEvent(new Event("locationchange")),e}}),window.addEventListener("popstate",()=>window.dispatchEvent(new Event("locationchange"))),window.addEventListener("hashchange",()=>window.dispatchEvent(new Event("locationchange"))),window.addEventListener("locationchange",notify),window.__drainAutomationChanges=function(){const e=Q.slice();return Q.length=0,e};return!0})()"##;
+
+/// Drains the recorded changes as an array; returns [] if not installed.
+#[cfg(feature = "chrome")]
+const DRAIN_CHANGES_JS: &str = r#"(function(){ try { return (window.__drainAutomationChanges && window.__drainAutomationChanges()) || []; } catch(e){ return []; } })()"#;
+
+#[cfg(feature = "chrome")]
+/// Run automation scripts with state tracking.
+pub async fn eval_automation_scripts_tracking(
+    page: &chromiumoxide::Page,
+    target_url: &str,
+    automation_scripts: &Option<AutomationScripts>,
+    automation_data: &mut Vec<crate::page::AutomationResults>, // no need for `mut` before the binding; &mut makes it mutable
+) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+
+    fn eval_expr(expr: &str) -> EvaluateParams {
+        EvaluateParams::builder()
+            .expression(expr)
+            .eval_as_function_fallback(true)
+            .build()
+            .expect("eval_expr build failed")
+    }
+
+    fn eval_value(expr: &str) -> EvaluateParams {
+        EvaluateParams::builder()
+            .expression(expr)
+            .return_by_value(true)
+            .build()
+            .expect("eval_value build failed")
+    }
+
+    let _ = page.evaluate(eval_expr(INSTALL_OBSERVER_JS)).await;
+    let _ = page.evaluate(eval_value(DRAIN_CHANGES_JS)).await;
+
+    /// The generic screenshot params.
+    fn ss_params() -> chromiumoxide::page::ScreenshotParams {
+        chromiumoxide::page::ScreenshotParams::builder()
+            .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
+            .full_page(true)
+            .quality(45)
+            .omit_background(false)
+            .build()
+    }
+
+    // Helper to drain recorded changes as a single JSON string
+    async fn drain_changes_json(page: &chromiumoxide::Page) -> Option<serde_json::Value> {
+        if let Ok(eval) = page.evaluate(eval_value(DRAIN_CHANGES_JS)).await {
+            if let Some(value) = eval.value() {
+                Some(value.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    let mut run_scripts: Option<&Vec<WebAutomation>> = None;
+
+    if let Some(script_map) = automation_scripts {
+        if let Some(scripts) = script_map.search(target_url) {
+            run_scripts = Some(scripts);
+        } else if script_map.match_all {
+            if let Some(scripts) = script_map.root.value.as_ref() {
+                run_scripts = Some(scripts);
+            }
+        }
+    }
+
+    if let Some(scripts) = run_scripts {
+        let mut valid = false;
+
+        for (idx, script) in scripts.iter().enumerate() {
+            if script == &WebAutomation::ValidateChain && !valid {
+                break;
+            }
+
+            let step_name = format!("step_{}_{}", idx + 1, script.label());
+
+            let step_result =
+                tokio::time::timeout(tokio::time::Duration::from_secs(60), script.run(page)).await;
+
+            let mut automation_results = crate::page::AutomationResults::default();
+            automation_results.input = format!("automation:{} url:{}", step_name, target_url);
+
+            match step_result {
+                Ok(next) => {
+                    valid = next;
+                    if let Some(changes_json) = drain_changes_json(page).await {
+                        automation_results.content_output = changes_json;
+                    }
+                    if let Ok(ss) = page.screenshot(ss_params()).await {
+                        automation_results.screenshot_output = Some(STANDARD.encode(&ss));
+                    }
+                }
+                Err(elapsed) => {
+                    automation_results.error = Some(format!(
+                        "Script execution timed out for: {} - {}",
+                        target_url, elapsed
+                    ));
+                    if let Some(changes_json) = drain_changes_json(page).await {
+                        automation_results.content_output = changes_json;
+                    }
+                    if let Ok(ss) = page.screenshot(ss_params()).await {
+                        automation_results.screenshot_output = Some(STANDARD.encode(&ss));
+                    }
+                    log::warn!("Script execution timed out for: {target_url} - {elapsed}");
+                }
+            }
+
+            automation_data.push(automation_results);
         }
     }
 }
