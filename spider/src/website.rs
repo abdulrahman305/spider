@@ -600,7 +600,7 @@ impl Website {
     /// Check if the disk is enabled. This does nothing with `disk` flag enabled.
     #[cfg(not(feature = "disk"))]
     pub(crate) fn shared_disk_enabled(&self) -> bool {
-        self.configuration.shared && self.sqlite.is_some()
+        false
     }
 
     /// Check if the disk is enabled. This does nothing with `disk` flag enabled.
